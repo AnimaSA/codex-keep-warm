@@ -59,6 +59,7 @@ pub struct Account {
     pub label: String,
     pub email: Option<String>,
     pub plan: Option<String>,
+    pub connected: bool,
     pub enabled: bool,
     pub warmup_times: Vec<DailyTime>,
     pub ledger: WarmLedger,
@@ -71,6 +72,7 @@ impl Default for Account {
             label: String::new(),
             email: None,
             plan: None,
+            connected: false,
             enabled: true,
             warmup_times: Vec::new(),
             ledger: WarmLedger::default(),
@@ -107,6 +109,23 @@ impl Account {
         }
     }
 
+    pub fn confirm_warmed_windows(&mut self, windows: &UsageWindows) {
+        if let Some(key) = windows
+            .session
+            .as_ref()
+            .and_then(|window| window.key("session"))
+        {
+            self.ledger.confirmed_session_key = Some(key);
+        }
+        if let Some(key) = windows
+            .weekly
+            .as_ref()
+            .and_then(|window| window.key("weekly"))
+        {
+            self.ledger.confirmed_weekly_key = Some(key);
+        }
+    }
+
     pub fn record_success(&mut self, plan: &WarmPlan, now: i64) {
         if let Some(key) = &plan.session_key {
             self.ledger.confirmed_session_key = Some(key.clone());
@@ -131,6 +150,15 @@ impl Account {
             at: now,
             reason,
             success: false,
+        });
+    }
+
+    pub fn record_manual_success(&mut self, now: i64) {
+        self.ledger.retry_after = None;
+        self.ledger.last_warmup = Some(WarmRecord {
+            at: now,
+            reason: WarmReason::Manual,
+            success: true,
         });
     }
 }
@@ -193,11 +221,11 @@ impl LimitWindow {
         ))
     }
 
-    fn is_fresh_or_reset(&self, now: i64) -> bool {
+    fn is_fresh(&self, now: i64) -> bool {
         let (Some(duration), Some(reset)) = (self.window_duration_mins, self.resets_at) else {
             return false;
         };
-        reset <= now + 1 || reset - now >= duration * 60 - RESET_FRESH_TOLERANCE_SECS
+        reset - now >= duration * 60 - RESET_FRESH_TOLERANCE_SECS
     }
 }
 
@@ -205,8 +233,6 @@ impl LimitWindow {
 #[serde(rename_all = "camelCase")]
 pub struct RateLimitSnapshot {
     pub limit_id: Option<String>,
-    pub limit_name: Option<String>,
-    pub plan_type: Option<String>,
     pub primary: Option<LimitWindow>,
     pub secondary: Option<LimitWindow>,
 }
@@ -241,21 +267,25 @@ impl UsageWindows {
         let primary = snapshot.primary.clone();
         let secondary = snapshot.secondary.clone();
         let all = [primary.clone(), secondary.clone()];
+        let matches_duration = |window: &LimitWindow, minutes: i64| {
+            window
+                .window_duration_mins
+                .is_some_and(|duration| (duration - minutes).abs() <= minutes / 20)
+        };
         let by_duration = |minutes| {
             all.iter()
                 .flatten()
-                .find(|window| window.window_duration_mins == Some(minutes))
+                .find(|window| matches_duration(window, minutes))
                 .cloned()
         };
 
         let session = by_duration(SESSION_MINUTES).or_else(|| {
             primary
                 .clone()
-                .filter(|window| window.window_duration_mins != Some(WEEK_MINUTES))
+                .filter(|window| !matches_duration(window, WEEK_MINUTES))
         });
-        let weekly = by_duration(WEEK_MINUTES).or_else(|| {
-            secondary.filter(|window| window.window_duration_mins != Some(SESSION_MINUTES))
-        });
+        let weekly = by_duration(WEEK_MINUTES)
+            .or_else(|| secondary.filter(|window| !matches_duration(window, SESSION_MINUTES)));
 
         Self { session, weekly }
     }
@@ -281,10 +311,6 @@ impl WarmPlan {
         } else {
             WarmReason::SafeGap
         }
-    }
-
-    pub fn manual() -> Self {
-        Self::default()
     }
 }
 
@@ -359,8 +385,12 @@ fn candidate_key(
     now: i64,
 ) -> Option<String> {
     let window = window?;
-    let key = window.key(kind)?;
-    (confirmed != Some(&key) && window.used_percent == 0 && window.is_fresh_or_reset(now))
+    let mut key = window.key(kind)?;
+    let expired = window.resets_at.is_some_and(|reset| reset <= now + 1);
+    if expired {
+        key.push_str(":expired");
+    }
+    (confirmed != Some(&key) && (expired || window.used_percent == 0 && window.is_fresh(now)))
         .then_some(key)
 }
 
@@ -534,17 +564,37 @@ mod tests {
     }
 
     #[test]
+    fn expired_full_weekly_window_starts_once() {
+        let now = local_time(12, 0);
+        let mut account = account_with_schedule();
+        let window = LimitWindow {
+            used_percent: 100,
+            window_duration_mins: Some(WEEK_MINUTES),
+            resets_at: Some(now.timestamp() - 1),
+        };
+        account.ledger.confirmed_weekly_key = window.key("weekly");
+        let windows = UsageWindows {
+            session: None,
+            weekly: Some(window),
+        };
+        let plan = plan_warmup(now, &account, &windows);
+        assert!(plan.weekly_key.as_deref().unwrap().ends_with(":expired"));
+        account.record_success(&plan, now.timestamp());
+        assert!(plan_warmup(now, &account, &windows).is_empty());
+    }
+
+    #[test]
     fn normalizes_reversed_windows_by_duration() {
         let response = RateLimitResponse {
             rate_limits: RateLimitSnapshot {
                 primary: Some(LimitWindow {
                     used_percent: 20,
-                    window_duration_mins: Some(WEEK_MINUTES),
+                    window_duration_mins: Some(WEEK_MINUTES - 1),
                     resets_at: Some(2),
                 }),
                 secondary: Some(LimitWindow {
                     used_percent: 10,
-                    window_duration_mins: Some(SESSION_MINUTES),
+                    window_duration_mins: Some(SESSION_MINUTES + 1),
                     resets_at: Some(1),
                 }),
                 ..RateLimitSnapshot::default()

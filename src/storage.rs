@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -80,7 +80,7 @@ impl Store {
             .map_err(|error| format!("Could not create account storage: {error}"))?;
         let config = home.join("config.toml");
         if !config.exists() {
-            fs::write(config, "cli_auth_credentials_store = \"auto\"\n")
+            fs::write(config, "cli_auth_credentials_store = \"keyring\"\n")
                 .map_err(|error| format!("Could not configure account storage: {error}"))?;
         }
         Ok(())
@@ -93,10 +93,6 @@ impl Store {
                 .map_err(|error| format!("Could not remove account credentials: {error}"))?;
         }
         Ok(())
-    }
-
-    pub fn root(&self) -> &Path {
-        &self.root
     }
 
     fn settings_path(&self) -> PathBuf {

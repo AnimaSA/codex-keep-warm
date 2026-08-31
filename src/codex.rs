@@ -20,6 +20,12 @@ pub struct AccountSnapshot {
     pub limits: UsageWindows,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct WarmupOutcome {
+    pub snapshot: Option<AccountSnapshot>,
+    pub refresh_error: Option<String>,
+}
+
 struct AppServer {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -230,22 +236,17 @@ pub async fn fetch_snapshot(codex_home: &Path) -> Result<AccountSnapshot, String
     snapshot
 }
 
-pub async fn warm_and_fetch(
-    codex_home: &Path,
-    workspace: &Path,
-) -> Result<AccountSnapshot, String> {
+pub async fn warm_and_fetch(codex_home: &Path, workspace: &Path) -> Result<WarmupOutcome, String> {
     let mut server = AppServer::start(codex_home).await?;
     let thread = server
         .request(
             "thread/start",
             Some(json!({
-                "model": "gpt-5.6-luna",
-                "allowProviderModelFallback": true,
                 "cwd": workspace,
                 "ephemeral": true,
                 "approvalPolicy": "never",
                 "sandbox": "read-only",
-                "baseInstructions": "You are Codex. Reply with OK.",
+                "baseInstructions": "Reply exactly OK. Do not use tools.",
                 "developerInstructions": "",
                 "dynamicTools": [],
                 "environments": [],
@@ -265,7 +266,9 @@ pub async fn warm_and_fetch(
             "turn/start",
             Some(json!({
                 "threadId": thread_id,
-                "input": [{ "type": "text", "text": "Thanks" }]
+                "input": [{ "type": "text", "text": "Reply exactly OK." }],
+                "effort": "low",
+                "summary": "none"
             })),
         )
         .await?;
@@ -284,9 +287,15 @@ pub async fn warm_and_fetch(
             .to_string());
     }
 
-    let snapshot = read_snapshot(&mut server).await;
+    let (snapshot, refresh_error) = match read_snapshot(&mut server).await {
+        Ok(snapshot) => (Some(snapshot), None),
+        Err(error) => (None, Some(error)),
+    };
     server.close().await;
-    snapshot
+    Ok(WarmupOutcome {
+        snapshot,
+        refresh_error,
+    })
 }
 
 pub async fn logout(codex_home: &Path) -> Result<(), String> {
