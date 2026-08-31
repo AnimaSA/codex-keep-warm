@@ -1,0 +1,8 @@
+[application]
+name = "Codex Keep Warm"
+default_platform = "desktop"
+
+[bundle]
+identifier = "com.codexkeepwarm.app"
+publisher = "Codex Keep Warm"
+

@@ -1,0 +1,13 @@
+[package]
+name = "codex-keep-warm"
+version = "0.1.0"
+edition = "2024"
+description = "Keep ChatGPT Codex quota windows aligned across multiple accounts"
+
+[dependencies]
+chrono = { version = "0.4.41", features = ["serde"] }
+dioxus = { version = "0.6.3", features = ["desktop"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.47", features = ["io-util", "process", "time"] }
+
