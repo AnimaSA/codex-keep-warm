@@ -7,7 +7,7 @@ pub const SESSION_MINUTES: i64 = 300;
 pub const WEEK_MINUTES: i64 = 10_080;
 const RESET_FRESH_TOLERANCE_SECS: i64 = 300;
 const AUTO_GUARD_SECS: i64 = 120;
-const SCHEDULE_GRACE_SECS: i64 = 60;
+const SCHEDULE_GRACE_SECS: i64 = 180;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -96,23 +96,36 @@ impl Account {
         }
     }
 
-    pub fn observe_active_windows(&mut self, windows: &UsageWindows) {
+    pub fn observe_active_windows(&mut self, windows: &UsageWindows, now: i64) {
         if let Some(window) = &windows.session
-            && window.used_percent > 0
+            && window.resets_at > Some(now)
+            && (window.used_percent > 0
+                || self
+                    .ledger
+                    .confirmed_session_key
+                    .as_deref()
+                    .is_some_and(|key| key.ends_with(":expired")))
         {
             self.ledger.confirmed_session_key = window.key("session");
         }
         if let Some(window) = &windows.weekly
-            && window.used_percent > 0
+            && window.resets_at > Some(now)
+            && (window.used_percent > 0
+                || self
+                    .ledger
+                    .confirmed_weekly_key
+                    .as_deref()
+                    .is_some_and(|key| key.ends_with(":expired")))
         {
             self.ledger.confirmed_weekly_key = window.key("weekly");
         }
     }
 
-    pub fn confirm_warmed_windows(&mut self, windows: &UsageWindows) {
+    pub fn confirm_warmed_windows(&mut self, windows: &UsageWindows, now: i64) {
         if let Some(key) = windows
             .session
             .as_ref()
+            .filter(|window| window.resets_at > Some(now))
             .and_then(|window| window.key("session"))
         {
             self.ledger.confirmed_session_key = Some(key);
@@ -120,6 +133,7 @@ impl Account {
         if let Some(key) = windows
             .weekly
             .as_ref()
+            .filter(|window| window.resets_at > Some(now))
             .and_then(|window| window.key("weekly"))
         {
             self.ledger.confirmed_weekly_key = Some(key);
@@ -264,9 +278,7 @@ impl UsageWindows {
             })
             .unwrap_or(&response.rate_limits);
 
-        let primary = snapshot.primary.clone();
-        let secondary = snapshot.secondary.clone();
-        let all = [primary.clone(), secondary.clone()];
+        let all = [snapshot.primary.clone(), snapshot.secondary.clone()];
         let matches_duration = |window: &LimitWindow, minutes: i64| {
             window
                 .window_duration_mins
@@ -279,13 +291,8 @@ impl UsageWindows {
                 .cloned()
         };
 
-        let session = by_duration(SESSION_MINUTES).or_else(|| {
-            primary
-                .clone()
-                .filter(|window| !matches_duration(window, WEEK_MINUTES))
-        });
-        let weekly = by_duration(WEEK_MINUTES)
-            .or_else(|| secondary.filter(|window| !matches_duration(window, SESSION_MINUTES)));
+        let session = by_duration(SESSION_MINUTES);
+        let weekly = by_duration(WEEK_MINUTES);
 
         Self { session, weekly }
     }
@@ -349,9 +356,11 @@ pub fn plan_warmup<Tz: TimeZone>(
         );
     }
 
-    if !weekly_blocked
+    if can_retry
+        && !weekly_blocked
         && let Some(slot) = due_slot(&now, &account.warmup_times)
         && account.ledger.last_schedule_key.as_deref() != Some(&slot.key)
+        && schedule_window_ready(&slot, windows.session.as_ref(), now_ts)
     {
         plan.schedule_key = Some(slot.key);
     }
@@ -386,7 +395,7 @@ fn candidate_key(
 ) -> Option<String> {
     let window = window?;
     let mut key = window.key(kind)?;
-    let expired = window.resets_at.is_some_and(|reset| reset <= now + 1);
+    let expired = window.resets_at.is_some_and(|reset| reset <= now);
     if expired {
         key.push_str(":expired");
     }
@@ -406,11 +415,17 @@ fn filler_is_safe<Tz: TimeZone>(
         .is_none_or(|slot| now.timestamp() + duration * 60 + AUTO_GUARD_SECS <= slot.at)
 }
 
+fn schedule_window_ready(slot: &ScheduleSlot, session: Option<&LimitWindow>, now: i64) -> bool {
+    !session
+        .and_then(|window| window.resets_at)
+        .is_some_and(|reset| reset > now && reset <= slot.at + SCHEDULE_GRACE_SECS)
+}
+
 pub fn due_slot<Tz: TimeZone>(now: &DateTime<Tz>, times: &[DailyTime]) -> Option<ScheduleSlot> {
     let now_ts = now.timestamp();
     times.iter().find_map(|time| {
         let at = resolve_local(&now.timezone(), now.date_naive(), *time)?;
-        (now_ts >= at && now_ts < at + SCHEDULE_GRACE_SECS).then(|| ScheduleSlot {
+        (now_ts >= at && now_ts <= at + SCHEDULE_GRACE_SECS).then(|| ScheduleSlot {
             at,
             key: format!("{}@{time}", now.date_naive()),
         })
@@ -533,6 +548,24 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_slot_waits_for_a_slightly_late_reset() {
+        let scheduled = local_time(13, 0);
+        let account = account_with_schedule();
+        let mut windows = reset_window(scheduled.timestamp(), 0);
+        windows.session.as_mut().unwrap().resets_at = Some(scheduled.timestamp() + 5);
+        assert!(plan_warmup(scheduled, &account, &windows).is_empty());
+
+        let after_reset = local_time(13, 0) + chrono::Duration::seconds(30);
+        windows.session.as_mut().unwrap().resets_at =
+            Some(after_reset.timestamp() + SESSION_MINUTES * 60);
+        assert!(
+            plan_warmup(after_reset, &account, &windows)
+                .schedule_key
+                .is_some()
+        );
+    }
+
+    #[test]
     fn safe_gap_allows_early_reset_and_protects_next_slot() {
         let early = local_time(1, 0);
         let account = account_with_schedule();
@@ -580,7 +613,19 @@ mod tests {
         let plan = plan_warmup(now, &account, &windows);
         assert!(plan.weekly_key.as_deref().unwrap().ends_with(":expired"));
         account.record_success(&plan, now.timestamp());
+        account.confirm_warmed_windows(&windows, now.timestamp());
         assert!(plan_warmup(now, &account, &windows).is_empty());
+
+        let fresh = UsageWindows {
+            session: None,
+            weekly: Some(LimitWindow {
+                used_percent: 0,
+                window_duration_mins: Some(WEEK_MINUTES),
+                resets_at: Some(now.timestamp() + WEEK_MINUTES * 60),
+            }),
+        };
+        account.observe_active_windows(&fresh, now.timestamp());
+        assert!(plan_warmup(now, &account, &fresh).is_empty());
     }
 
     #[test]
@@ -604,6 +649,25 @@ mod tests {
         let normalized = UsageWindows::from_response(response);
         assert_eq!(normalized.session.unwrap().resets_at, Some(1));
         assert_eq!(normalized.weekly.unwrap().resets_at, Some(2));
+    }
+
+    #[test]
+    fn ignores_unrelated_limit_windows() {
+        let response = RateLimitResponse {
+            rate_limits: RateLimitSnapshot {
+                primary: Some(LimitWindow {
+                    used_percent: 10,
+                    window_duration_mins: Some(15),
+                    resets_at: Some(1),
+                }),
+                ..RateLimitSnapshot::default()
+            },
+            rate_limits_by_limit_id: None,
+        };
+        assert_eq!(
+            UsageWindows::from_response(response),
+            UsageWindows::default()
+        );
     }
 
     #[test]

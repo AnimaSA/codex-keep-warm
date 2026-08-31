@@ -102,18 +102,18 @@ fn App() -> Element {
     use_future(move || async move {
         let mut tick = 0_u64;
         loop {
-            now.set(Local::now().timestamp());
-            if tick.is_multiple_of(30) {
-                let ids = state
-                    .read()
-                    .accounts
-                    .iter()
-                    .filter(|view| view.account.connected && view.busy.is_none())
-                    .map(|view| view.account.id.clone())
-                    .collect::<Vec<_>>();
-                for id in ids {
-                    spawn(refresh_account(state, id, true));
-                }
+            let current = Local::now().timestamp();
+            now.set(current);
+            let ids = state
+                .read()
+                .accounts
+                .iter()
+                .filter(|view| view.account.connected && view.busy.is_none())
+                .filter(|view| tick.is_multiple_of(30) || weekly_reset_needs_probe(view, current))
+                .map(|view| view.account.id.clone())
+                .collect::<Vec<_>>();
+            for id in ids {
+                spawn(refresh_account(state, id, true));
             }
             tick += 1;
             sleep(Duration::from_secs(1)).await;
@@ -243,6 +243,7 @@ fn App() -> Element {
                             let warm_id = id.clone();
                             let login_id = id.clone();
                             let toggle_id = id.clone();
+                            let draft_time_id = id.clone();
                             let add_time_id = id.clone();
                             let delete_id = id.clone();
                             let confirm_delete_id = id.clone();
@@ -363,7 +364,7 @@ fn App() -> Element {
                                                     aria_label: "New warmup time",
                                                     value: "{view.draft_time}",
                                                     disabled: busy,
-                                                    oninput: move |event| update_draft_time(state, &id, event.value())
+                                                    oninput: move |event| update_draft_time(state, &draft_time_id, event.value())
                                                 }
                                                 button {
                                                     class: "button compact",
@@ -552,7 +553,13 @@ fn LimitPanel(label: String, window: Option<LimitWindow>, now: i64) -> Element {
                     span { "{label}" }
                     strong { "{remaining}%" }
                 }
-                div { class: "progress-track", aria_label: "{remaining}% remaining",
+                div {
+                    class: "progress-track",
+                    role: "progressbar",
+                    aria_label: "{label} remaining",
+                    aria_valuemin: "0",
+                    aria_valuemax: "100",
+                    aria_valuenow: "{remaining}",
                     div { class: "{progress_class}", style: "width: {remaining}%" }
                 }
                 div { class: "limit-meta",
@@ -593,7 +600,7 @@ async fn login_account(mut state: Signal<AppState>, id: String) {
         Ok(snapshot) => {
             apply_snapshot(&mut account, &snapshot);
             account.connected = true;
-            account.observe_active_windows(&snapshot.limits);
+            account.observe_active_windows(&snapshot.limits, Local::now().timestamp());
             finish_operation(state, &id, account, Some(snapshot.limits), None);
             state.write().notice = Some(Notice {
                 message:
@@ -610,7 +617,6 @@ async fn refresh_account(mut state: Signal<AppState>, id: String, automatic: boo
     let Some((store, mut account)) = begin_operation(state, &id, "Refreshing limits") else {
         return;
     };
-    let poll_time = Local::now();
     let initial = match codex::fetch_snapshot(&store.account_home(&id)).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -623,14 +629,15 @@ async fn refresh_account(mut state: Signal<AppState>, id: String, automatic: boo
     };
     apply_snapshot(&mut account, &initial);
     account.connected = true;
-    account.observe_active_windows(&initial.limits);
+    let decision_time = Local::now();
+    account.observe_active_windows(&initial.limits, decision_time.timestamp());
 
     if !automatic {
         finish_operation(state, &id, account, Some(initial.limits), None);
         return;
     }
 
-    let plan = plan_warmup(poll_time, &account, &initial.limits);
+    let plan = plan_warmup(decision_time, &account, &initial.limits);
     if plan.is_empty() {
         finish_operation(state, &id, account, Some(initial.limits), None);
         return;
@@ -639,14 +646,15 @@ async fn refresh_account(mut state: Signal<AppState>, id: String, automatic: boo
     set_busy(&mut state, &id, format!("Starting {}", plan.reason()));
     match codex::warm_and_fetch(&store.account_home(&id), &store.warmup_workspace(&id)).await {
         Ok(outcome) => {
-            account.record_success(&plan, Local::now().timestamp());
+            let completed_at = Local::now().timestamp();
+            account.record_success(&plan, completed_at);
             let limits = outcome
                 .snapshot
                 .as_ref()
                 .map(|snapshot| {
                     apply_snapshot(&mut account, snapshot);
-                    account.observe_active_windows(&snapshot.limits);
-                    account.confirm_warmed_windows(&snapshot.limits);
+                    account.observe_active_windows(&snapshot.limits, completed_at);
+                    account.confirm_warmed_windows(&snapshot.limits, completed_at);
                     snapshot.limits.clone()
                 })
                 .unwrap_or(initial.limits);
@@ -665,11 +673,12 @@ async fn manual_warmup(mut state: Signal<AppState>, id: String) {
     };
     match codex::warm_and_fetch(&store.account_home(&id), &store.warmup_workspace(&id)).await {
         Ok(outcome) => {
-            account.record_manual_success(Local::now().timestamp());
+            let completed_at = Local::now().timestamp();
+            account.record_manual_success(completed_at);
             let limits = outcome.snapshot.as_ref().map(|snapshot| {
                 apply_snapshot(&mut account, snapshot);
-                account.observe_active_windows(&snapshot.limits);
-                account.confirm_warmed_windows(&snapshot.limits);
+                account.observe_active_windows(&snapshot.limits, completed_at);
+                account.confirm_warmed_windows(&snapshot.limits, completed_at);
                 snapshot.limits.clone()
             });
             finish_operation(state, &id, account, limits, outcome.refresh_error);
@@ -689,9 +698,7 @@ async fn delete_account(mut state: Signal<AppState>, id: String) {
     let Some((store, account)) = begin_operation(state, &id, "Removing account credentials") else {
         return;
     };
-    if account.connected
-        && let Err(error) = codex::logout(&store.account_home(&id)).await
-    {
+    if let Err(error) = codex::logout(&store.account_home(&id)).await {
         finish_operation(state, &id, account, None, Some(error));
         return;
     }
@@ -918,4 +925,25 @@ fn account_status(view: &AccountView, now: &chrono::DateTime<Local>) -> String {
     next_slot(now, &view.account.warmup_times)
         .map(|slot| format!("Next scheduled {}", format_slot(slot.at)))
         .unwrap_or_else(|| "Watching for reset windows".to_string())
+}
+
+fn weekly_reset_needs_probe(view: &AccountView, now: i64) -> bool {
+    let Some(window) = view
+        .limits
+        .as_ref()
+        .and_then(|limits| limits.weekly.as_ref())
+    else {
+        return false;
+    };
+    let Some(base_key) = window.key("weekly") else {
+        return false;
+    };
+    let handled_key = format!("{base_key}:expired");
+    window.resets_at <= Some(now)
+        && view
+            .account
+            .ledger
+            .retry_after
+            .is_none_or(|retry| retry <= now)
+        && view.account.ledger.confirmed_weekly_key.as_deref() != Some(&handled_key)
 }

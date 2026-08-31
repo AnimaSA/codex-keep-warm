@@ -39,6 +39,9 @@ impl AppServer {
         let canonical_home = codex_home
             .canonicalize()
             .map_err(|error| format!("Could not open account storage: {error}"))?;
+        if canonical_home != codex_home {
+            return Err("Refusing to use aliased account storage".to_string());
+        }
         let mut command = Command::new("codex");
         command
             .args(["app-server", "--stdio"])
@@ -96,7 +99,9 @@ impl AppServer {
             let message = timeout(RPC_TIMEOUT, self.read_message())
                 .await
                 .map_err(|_| format!("Codex timed out while handling {method}"))??;
-            if message.get("id").and_then(Value::as_u64) == Some(id) {
+            if message.get("method").is_none()
+                && message.get("id").and_then(Value::as_u64) == Some(id)
+            {
                 if let Some(error) = message.get("error") {
                     let detail = error
                         .get("message")
@@ -170,8 +175,19 @@ impl AppServer {
                 .map_err(|error| format!("Could not read Codex response: {error}"))?
                 .ok_or_else(|| "Codex app server stopped unexpectedly".to_string())?;
             if !line.trim().is_empty() {
-                return serde_json::from_str(&line)
-                    .map_err(|error| format!("Codex returned invalid JSON: {error}"));
+                let message: Value = serde_json::from_str(&line)
+                    .map_err(|error| format!("Codex returned invalid JSON: {error}"))?;
+                if message.get("method").is_some()
+                    && let Some(id) = message.get("id")
+                {
+                    self.send(&json!({
+                        "id": id,
+                        "error": { "code": -32601, "message": "Unsupported server request" }
+                    }))
+                    .await?;
+                    continue;
+                }
+                return Ok(message);
             }
         }
     }
@@ -238,18 +254,22 @@ pub async fn fetch_snapshot(codex_home: &Path) -> Result<AccountSnapshot, String
 
 pub async fn warm_and_fetch(codex_home: &Path, workspace: &Path) -> Result<WarmupOutcome, String> {
     let mut server = AppServer::start(codex_home).await?;
+    let canonical_workspace = workspace
+        .canonicalize()
+        .map_err(|error| format!("Could not open the warmup workspace: {error}"))?;
+    if canonical_workspace != workspace {
+        return Err("Refusing to use an aliased warmup workspace".to_string());
+    }
     let thread = server
         .request(
             "thread/start",
             Some(json!({
-                "cwd": workspace,
+                "cwd": canonical_workspace,
                 "ephemeral": true,
                 "approvalPolicy": "never",
                 "sandbox": "read-only",
                 "baseInstructions": "Reply exactly OK. Do not use tools.",
                 "developerInstructions": "",
-                "dynamicTools": [],
-                "environments": [],
                 "config": {
                     "model_reasoning_effort": "low",
                     "model_verbosity": "low"

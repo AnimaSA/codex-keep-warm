@@ -11,7 +11,6 @@
 html,
 body {
   margin: 0;
-  min-width: 760px;
   min-height: 100%;
   background:
     radial-gradient(circle at 82% -12%, rgba(177, 255, 93, 0.08), transparent 32rem),
@@ -292,8 +291,8 @@ input[type="time"] { color-scheme: dark; font-variant-numeric: tabular-nums; }
 .empty-state p:not(.eyebrow) { max-width: 470px; margin: 12px 0 23px; color: #808894; font-size: 13px; line-height: 1.6; }
 .app-footer { display: flex; justify-content: space-between; padding: 18px 2px 0; color: #555d68; font-size: 9px; }
 
-.modal-backdrop { position: fixed; z-index: 10; inset: 0; display: grid; place-items: center; padding: 30px; background: rgba(4, 5, 7, 0.76); backdrop-filter: blur(8px); }
-.modal { width: min(520px, 100%); padding: 25px; border: 1px solid #323842; border-radius: 16px; background: #15181d; box-shadow: 0 28px 90px rgba(0, 0, 0, 0.55); }
+.modal-backdrop { position: fixed; z-index: 10; inset: 0; display: grid; overflow-y: auto; place-items: center; padding: 30px; background: rgba(4, 5, 7, 0.76); backdrop-filter: blur(8px); }
+.modal { width: min(520px, 100%); max-height: calc(100vh - 60px); overflow-y: auto; padding: 25px; border: 1px solid #323842; border-radius: 16px; background: #15181d; box-shadow: 0 28px 90px rgba(0, 0, 0, 0.55); }
 .modal-head { justify-content: space-between; }
 .modal-close { align-self: flex-start; color: #7e8792; font-size: 25px; line-height: 1; }
 .modal-copy { margin: 14px 0 22px; color: #858d98; font-size: 12px; line-height: 1.55; }
@@ -320,4 +319,19 @@ input[type="time"] { color-scheme: dark; font-variant-numeric: tabular-nums; }
   .account-head { align-items: flex-start; }
   .card-actions { flex-wrap: wrap; justify-content: flex-end; }
   .schedule-panel { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 620px) {
+  .app-shell { width: calc(100% - 24px); padding-top: 18px; }
+  .topbar, .account-head, .card-footer { align-items: stretch; flex-direction: column; }
+  .top-actions, .card-actions { justify-content: space-between; }
+  .hero { padding: 38px 0 32px; }
+  .hero h1 { font-size: 38px; }
+  .summary-grid, .limit-grid { grid-template-columns: 1fr; }
+  .summary-card { border-right: 0; border-bottom: 1px solid #262b32; }
+  .summary-card:last-child { border-bottom: 0; }
+  .modal-backdrop { align-items: start; padding: 14px; }
+  .modal { max-height: calc(100vh - 28px); }
+  .modal-times { grid-template-columns: 1fr; }
+  .app-footer { flex-direction: column; gap: 6px; }
 }
