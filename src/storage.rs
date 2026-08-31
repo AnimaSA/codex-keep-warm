@@ -70,14 +70,12 @@ impl Store {
             .into_iter()
             .find(|path| path.exists());
         let Some(path) = path else {
-            return Ok(AppConfig {
-                version: 1,
-                accounts: Vec::new(),
-            });
+            return Ok(AppConfig::default());
         };
         let bytes = fs::read(path).map_err(|error| format!("Could not read settings: {error}"))?;
         let mut config: AppConfig = serde_json::from_slice(&bytes)
             .map_err(|error| format!("Settings are invalid: {error}"))?;
+        config.refresh_interval_secs = config.refresh_interval_secs.clamp(5, 3600);
         let mut ids = HashSet::new();
         for account in &mut config.accounts {
             validate_account_id(&account.id)?;
@@ -90,9 +88,14 @@ impl Store {
         Ok(config)
     }
 
-    pub fn save_accounts(&self, accounts: &[Account]) -> Result<(), String> {
+    pub fn save_accounts(
+        &self,
+        accounts: &[Account],
+        refresh_interval_secs: u64,
+    ) -> Result<(), String> {
         let config = AppConfig {
             version: 1,
+            refresh_interval_secs,
             accounts: accounts.to_vec(),
         };
         let bytes = serde_json::to_vec_pretty(&config)
@@ -236,8 +239,11 @@ mod tests {
         let store = Store::new(root.clone()).unwrap();
         let account = Account::new("abc001".into(), "Personal".into());
         store.prepare_account(&account.id).unwrap();
-        store.save_accounts(std::slice::from_ref(&account)).unwrap();
+        store
+            .save_accounts(std::slice::from_ref(&account), 45)
+            .unwrap();
         assert_eq!(store.load().unwrap().accounts[0].label, "Personal");
+        assert_eq!(store.load().unwrap().refresh_interval_secs, 45);
         assert!(store.account_home(&account.id).join("config.toml").exists());
         assert!(!store.account_home(&account.id).join("auth.json").exists());
         assert!(validate_account_id("../../target").is_err());

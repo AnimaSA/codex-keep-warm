@@ -1,17 +1,25 @@
+#![cfg_attr(all(target_os = "windows", not(test)), windows_subsystem = "windows")]
+
 mod codex;
 mod domain;
+#[cfg(target_os = "windows")]
+mod startup;
 mod storage;
 
 use std::str::FromStr;
 
 use chrono::{Local, TimeZone};
+use dioxus::desktop::{
+    Config, WindowBuilder, WindowCloseBehaviour,
+    trayicon::{default_tray_icon, init_tray_icon},
+};
 use dioxus::prelude::*;
 use tokio::time::{Duration, sleep};
 
 use codex::AccountSnapshot;
 use domain::{
-    Account, DailyTime, LimitWindow, UsageWindows, WarmReason, format_reset, next_slot,
-    plan_warmup, schedule_gap_warning,
+    Account, DEFAULT_REFRESH_INTERVAL_SECS, DailyTime, LimitWindow, UsageWindows, WarmReason,
+    format_reset, next_slot, plan_warmup, schedule_gap_warning,
 };
 use storage::{Store, new_account_id};
 
@@ -48,6 +56,7 @@ struct Notice {
 struct AppState {
     store: Option<Store>,
     accounts: Vec<AccountView>,
+    refresh_interval_secs: u64,
     fatal: Option<String>,
     notice: Option<Notice>,
 }
@@ -58,6 +67,7 @@ impl AppState {
             Err(error) => Self {
                 store: None,
                 accounts: Vec::new(),
+                refresh_interval_secs: DEFAULT_REFRESH_INTERVAL_SECS,
                 fatal: Some(error),
                 notice: None,
             },
@@ -65,12 +75,14 @@ impl AppState {
                 Ok(config) => Self {
                     store: Some(store),
                     accounts: config.accounts.into_iter().map(AccountView::new).collect(),
+                    refresh_interval_secs: config.refresh_interval_secs,
                     fatal: None,
                     notice: None,
                 },
                 Err(error) => Self {
                     store: Some(store),
                     accounts: Vec::new(),
+                    refresh_interval_secs: DEFAULT_REFRESH_INTERVAL_SECS,
                     fatal: Some(error),
                     notice: None,
                 },
@@ -80,11 +92,23 @@ impl AppState {
 }
 
 fn main() {
-    dioxus::launch(App);
+    let starts_hidden = std::env::args_os().any(|arg| arg == "--hidden");
+    let config = Config::new()
+        .with_window(
+            WindowBuilder::new()
+                .with_title("Codex Keep Warm")
+                .with_visible(!starts_hidden),
+        )
+        .with_close_behaviour(WindowCloseBehaviour::LastWindowHides);
+
+    dioxus::LaunchBuilder::desktop()
+        .with_cfg(config)
+        .launch(App);
 }
 
 #[component]
 fn App() -> Element {
+    let _tray = use_hook(|| init_tray_icon(default_tray_icon(), None));
     let mut state = use_signal(AppState::load);
     let mut now = use_signal(|| Local::now().timestamp());
     let mut show_add = use_signal(|| false);
@@ -104,14 +128,18 @@ fn App() -> Element {
         loop {
             let current = Local::now().timestamp();
             now.set(current);
-            let ids = state
-                .read()
+            let current_state = state.read();
+            let ids = current_state
                 .accounts
                 .iter()
                 .filter(|view| view.account.connected && view.busy.is_none())
-                .filter(|view| tick.is_multiple_of(30) || weekly_reset_needs_probe(view, current))
+                .filter(|view| {
+                    tick.is_multiple_of(current_state.refresh_interval_secs)
+                        || weekly_reset_needs_probe(view, current)
+                })
                 .map(|view| view.account.id.clone())
                 .collect::<Vec<_>>();
+            drop(current_state);
             for id in ids {
                 spawn(refresh_account(state, id, true));
             }
@@ -173,6 +201,7 @@ fn App() -> Element {
                         span { class: "pulse-dot" }
                         "Scheduler running"
                     }
+                    StartupToggle { state }
                     button {
                         class: "button primary",
                         onclick: move |_| {
@@ -233,7 +262,22 @@ fn App() -> Element {
                             p { class: "eyebrow", "Accounts" }
                             h2 { "Windows and warmup times" }
                         }
-                        span { class: "poll-note", "Limits refresh every 30 seconds" }
+                        label { class: "poll-setting",
+                            "Refresh every"
+                            input {
+                                r#type: "number",
+                                min: "5",
+                                max: "3600",
+                                value: "{snapshot.refresh_interval_secs}",
+                                aria_label: "Limit refresh interval in seconds",
+                                onchange: move |event| {
+                                    if let Ok(seconds) = event.value().parse() {
+                                        set_refresh_interval(state, seconds);
+                                    }
+                                }
+                            }
+                            "seconds"
+                        }
                     }
 
                     for view in snapshot.accounts {
@@ -266,6 +310,12 @@ fn App() -> Element {
                                                 div { class: "name-line",
                                                     h3 { "{view.account.label}" }
                                                     span { class: "plan-badge", "{plan}" }
+                                                    if view.busy.as_deref() == Some("Refreshing limits") {
+                                                        span { class: "busy-status",
+                                                            span { class: "spinner" }
+                                                            "Refreshing limits"
+                                                        }
+                                                    }
                                                 }
                                                 p { "{identity}" }
                                             }
@@ -298,7 +348,9 @@ fn App() -> Element {
                                         }
                                     }
 
-                                    if let Some(action) = &view.busy {
+                                    if let Some(action) = &view.busy
+                                        && action != "Refreshing limits"
+                                    {
                                         div { class: "busy-line",
                                             span { class: "spinner" }
                                             "{action}"
@@ -425,7 +477,7 @@ fn App() -> Element {
 
             footer { class: "app-footer",
                 span { "Credentials are isolated per account by Codex." }
-                span { "The scheduler runs while this app is open." }
+                span { "Close hides to the tray. Click the tray icon to reopen." }
             }
         }
 
@@ -525,6 +577,53 @@ fn App() -> Element {
     }
 }
 
+#[cfg(target_os = "windows")]
+#[component]
+fn StartupToggle(mut state: Signal<AppState>) -> Element {
+    let mut enabled = use_signal(startup::is_enabled);
+
+    rsx! {
+        div { class: "scheduler-state",
+            "Start with Windows"
+            button {
+                class: if *enabled.read() { "switch on" } else { "switch" },
+                aria_label: "Start with Windows",
+                aria_pressed: "{enabled}",
+                onclick: move |_| {
+                    let next = !*enabled.read();
+                    match startup::set_enabled(next) {
+                        Ok(()) => {
+                            enabled.set(next);
+                            state.write().notice = Some(Notice {
+                                message: if next {
+                                    "Windows startup enabled. The app will open in the tray after sign-in."
+                                } else {
+                                    "Windows startup disabled."
+                                }
+                                .to_string(),
+                                error: false,
+                            });
+                        }
+                        Err(error) => {
+                            state.write().notice = Some(Notice {
+                                message: error,
+                                error: true,
+                            });
+                        }
+                    }
+                },
+                span {}
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+#[component]
+fn StartupToggle(_state: Signal<AppState>) -> Element {
+    None
+}
+
 #[component]
 fn SummaryCard(value: String, label: String) -> Element {
     rsx! {
@@ -547,6 +646,7 @@ fn LimitPanel(label: String, window: Option<LimitWindow>, now: i64) -> Element {
             "progress-fill"
         };
         let reset = format_reset(window.resets_at, now);
+        let reset_time = reset.strip_prefix("Resets in ");
         rsx! {
             section { class: "limit-panel",
                 div { class: "limit-top",
@@ -564,7 +664,14 @@ fn LimitPanel(label: String, window: Option<LimitWindow>, now: i64) -> Element {
                 }
                 div { class: "limit-meta",
                     span { "Remaining" }
-                    span { "{reset}" }
+                    span { class: "reset-time",
+                        if let Some(reset_time) = reset_time {
+                            span { class: "reset-label", "Resets in" }
+                            strong { "{reset_time}" }
+                        } else {
+                            strong { "{reset}" }
+                        }
+                    }
                 }
             }
         }
@@ -781,17 +888,22 @@ fn persist(mut state: Signal<AppState>) {
                 .iter()
                 .map(|view| view.account.clone())
                 .collect::<Vec<_>>();
-            (store, accounts)
+            (store, accounts, current.refresh_interval_secs)
         })
     };
-    if let Some((store, accounts)) = data
-        && let Err(error) = store.save_accounts(&accounts)
+    if let Some((store, accounts, refresh_interval_secs)) = data
+        && let Err(error) = store.save_accounts(&accounts, refresh_interval_secs)
     {
         state.write().notice = Some(Notice {
             message: error,
             error: true,
         });
     }
+}
+
+fn set_refresh_interval(mut state: Signal<AppState>, seconds: u64) {
+    state.write().refresh_interval_secs = seconds.clamp(5, 3600);
+    persist(state);
 }
 
 fn toggle_automatic(mut state: Signal<AppState>, id: &str) {

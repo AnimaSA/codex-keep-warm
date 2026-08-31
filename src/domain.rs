@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub const SESSION_MINUTES: i64 = 300;
 pub const WEEK_MINUTES: i64 = 10_080;
+pub const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 30;
 const RESET_FRESH_TOLERANCE_SECS: i64 = 300;
 const AUTO_GUARD_SECS: i64 = 120;
 const SCHEDULE_GRACE_SECS: i64 = 180;
@@ -45,11 +46,22 @@ impl FromStr for DailyTime {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub version: u8,
+    pub refresh_interval_secs: u64,
     pub accounts: Vec<Account>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            refresh_interval_secs: DEFAULT_REFRESH_INTERVAL_SECS,
+            accounts: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -9,8 +9,10 @@ A local Dioxus desktop app for viewing Codex subscription limits and aligning wa
 - Stores daily warmup times per account in the computer's local timezone.
 - Starts newly reset weekly windows first, then scheduled warmups, then opportunistic 5-hour windows.
 - Starts an opportunistic 5-hour window only when its observed duration plus a two-minute guard fits before the next scheduled time.
+- Runs in the system tray; closing the window keeps the scheduler running.
+- Can start with Windows and launch hidden in the tray.
 
-The app invokes the official Codex app-server protocol for login, limits, token refresh, and a minimal ephemeral turn. It does not read or write the active `~/.codex/auth.json`. The scheduler runs while the app is open.
+The app invokes the official Codex app-server protocol for login, limits, token refresh, and a minimal ephemeral turn. It does not read or write the active `~/.codex/auth.json`. Click the tray icon to reopen the window, or use its Exit item to stop the scheduler.
 
 ## Run
 
@@ -22,7 +24,7 @@ cargo run --release
 
 The current protocol integration is tested with `codex-cli 0.151.0`. Codex app-server schemas are versioned, so update the app if a future CLI reports an unsupported request.
 
-Add an account, complete the browser sign-in, and edit its warmup times. Limits refresh every 30 seconds.
+Add an account, complete the browser sign-in, and edit its warmup times. Limits refresh every 30 seconds by default; change the interval beside the account list heading.
 
 App metadata is stored under:
 

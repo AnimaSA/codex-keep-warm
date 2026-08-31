@@ -72,6 +72,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid #b8ff69; outline-
 .brand strong { font-size: 15px; letter-spacing: -0.01em; }
 .brand span { margin-top: 3px; color: #858c98; font-size: 12px; }
 .top-actions, .card-actions { gap: 10px; }
+.top-actions { flex-wrap: wrap; justify-content: flex-end; }
 
 .scheduler-state {
   display: flex;
@@ -185,7 +186,8 @@ button:focus-visible, input:focus-visible { outline: 2px solid #b8ff69; outline-
 .notice button { border: 0; background: transparent; color: inherit; font-size: 11px; font-weight: 750; cursor: pointer; }
 .section-heading { justify-content: space-between; margin-bottom: 16px; }
 .section-heading h2, .empty-state h2, .modal h2 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: -0.025em; }
-.poll-note { color: #717985; font-size: 11px; }
+.poll-setting { display: flex; align-items: center; gap: 7px; color: #717985; font-size: 11px; }
+.poll-setting input { width: 66px; min-height: 30px; padding: 0 8px; font-size: 11px; }
 .account-list { padding-top: 10px; }
 
 .account-card {
@@ -228,6 +230,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid #b8ff69; outline-
 
 .busy-line, .account-error { margin: 14px 22px 0; padding: 10px 12px; border-radius: 8px; font-size: 11px; }
 .busy-line { display: flex; align-items: center; gap: 9px; border: 1px solid #37412f; background: #192016; color: #c7e9a6; }
+.busy-status { display: inline-flex; align-items: center; gap: 6px; color: #9ebc82; font-size: 10px; white-space: nowrap; }
 .account-error { border: 1px solid #563239; background: #28191d; color: #f3aeb9; }
 .spinner { width: 11px; height: 11px; border: 2px solid rgba(199, 233, 166, 0.25); border-top-color: #c7e9a6; border-radius: 50%; animation: spin 800ms linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -243,6 +246,9 @@ button:focus-visible, input:focus-visible { outline: 2px solid #b8ff69; outline-
 .progress-fill.warning { background: #f0bf55; box-shadow: none; }
 .progress-fill.critical { background: #f06c7d; box-shadow: none; }
 .limit-meta { justify-content: space-between; margin-top: 10px; color: #707985; font-size: 10px; }
+.reset-time { display: inline-flex; align-items: baseline; gap: 5px; color: #aeb5bf; }
+.reset-time .reset-label { font-size: 11px; }
+.reset-time strong { color: #d9dde2; font-size: 16px; font-weight: 650; }
 
 .schedule-panel {
   display: grid;
@@ -259,14 +265,14 @@ button:focus-visible, input:focus-visible { outline: 2px solid #b8ff69; outline-
 .switch span { position: absolute; top: 3px; left: 3px; width: 10px; height: 10px; border-radius: 50%; background: #89919c; transition: left 140ms ease, background 140ms ease; }
 .switch.on { border-color: #6f944b; background: #304023; }
 .switch.on span { left: 16px; background: #b8ff69; }
-.time-editor { min-width: 0; }
+.time-editor { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; min-width: 0; }
 .time-chips { display: flex; flex-wrap: wrap; gap: 7px; min-height: 30px; }
 .time-chip, .empty-chip { display: inline-flex; align-items: center; min-height: 29px; border-radius: 7px; font-size: 11px; }
 .time-chip { gap: 7px; padding: 0 6px 0 10px; border: 1px solid #3c4435; background: #1e251a; color: #d2efb6; font-variant-numeric: tabular-nums; font-weight: 700; }
 .time-chip button { width: 20px; height: 20px; padding: 0; border: 0; background: transparent; color: #7e8b72; font-size: 15px; cursor: pointer; }
 .time-chip button:hover { color: #ecf6e4; }
 .empty-chip { color: #68717d; }
-.add-time { display: flex; gap: 8px; margin-top: 11px; }
+.add-time { display: flex; gap: 8px; }
 
 input { min-height: 38px; padding: 0 12px; border: 1px solid #343a43; border-radius: 8px; background: #111419; color: #f1f3f4; }
 input:hover:not(:disabled) { border-color: #49515d; }
