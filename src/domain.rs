@@ -75,6 +75,7 @@ pub struct Account {
     pub enabled: bool,
     pub warmup_times: Vec<DailyTime>,
     pub ledger: WarmLedger,
+    pub usage_history: UsageHistory,
 }
 
 impl Default for Account {
@@ -88,6 +89,7 @@ impl Default for Account {
             enabled: true,
             warmup_times: Vec::new(),
             ledger: WarmLedger::default(),
+            usage_history: UsageHistory::default(),
         }
     }
 }
@@ -187,6 +189,69 @@ impl Account {
             success: true,
         });
     }
+
+    pub fn record_usage(&mut self, windows: &UsageWindows, now: i64) {
+        self.usage_history
+            .session
+            .record(windows.session.as_ref(), "session", now);
+        self.usage_history
+            .weekly
+            .record(windows.weekly.as_ref(), "weekly", now);
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UsageHistory {
+    pub session: WindowHistory,
+    pub weekly: WindowHistory,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WindowHistory {
+    pub window_key: Option<String>,
+    pub points: Vec<UsagePoint>,
+    pub show_workweek_lines: bool,
+}
+
+impl WindowHistory {
+    fn record(&mut self, window: Option<&LimitWindow>, kind: &str, now: i64) {
+        let Some(window) = window else { return };
+        let Some(duration) = window.window_duration_mins else {
+            return;
+        };
+        let Some(reset) = window.resets_at else {
+            return;
+        };
+        let Some(key) = window.key(kind) else { return };
+        let prefix = format!("{kind}:{duration}:");
+        let same_window = self.window_key.as_deref().is_some_and(|previous| {
+            previous
+                .strip_prefix(&prefix)
+                .and_then(|value| value.parse::<i64>().ok())
+                .is_some_and(|previous_reset| {
+                    previous_reset.abs_diff(reset) <= RESET_FRESH_TOLERANCE_SECS as u64
+                })
+        });
+        if !same_window {
+            self.window_key = Some(key);
+            self.points.clear();
+        }
+        let point = UsagePoint {
+            at: now,
+            used_percent: window.used_percent.clamp(0, 100),
+        };
+        if self.points.last() != Some(&point) {
+            self.points.push(point);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsagePoint {
+    pub at: i64,
+    pub used_percent: i32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -549,6 +614,45 @@ mod tests {
             ["08:00", "18:00"]
         );
         assert!("24:00".parse::<DailyTime>().is_err());
+    }
+
+    #[test]
+    fn usage_history_tolerates_reset_jitter_but_clears_for_a_new_window() {
+        let mut account = Account::new("one".into(), "One".into());
+        let mut window = LimitWindow {
+            used_percent: 10,
+            window_duration_mins: Some(SESSION_MINUTES),
+            resets_at: Some(20_000),
+        };
+        account.record_usage(
+            &UsageWindows {
+                session: Some(window.clone()),
+                weekly: None,
+            },
+            10_000,
+        );
+
+        window.used_percent = 20;
+        window.resets_at = Some(20_030);
+        account.record_usage(
+            &UsageWindows {
+                session: Some(window.clone()),
+                weekly: None,
+            },
+            10_030,
+        );
+        assert_eq!(account.usage_history.session.points.len(), 2);
+
+        window.used_percent = 0;
+        window.resets_at = Some(38_000);
+        account.record_usage(
+            &UsageWindows {
+                session: Some(window),
+                weekly: None,
+            },
+            20_000,
+        );
+        assert_eq!(account.usage_history.session.points.len(), 1);
     }
 
     #[test]

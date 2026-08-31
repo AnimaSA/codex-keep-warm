@@ -236,16 +236,35 @@ button:focus-visible, input:focus-visible { outline: 2px solid #b8ff69; outline-
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .limit-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: #272c33; }
-.limit-panel { padding: 24px 22px 22px; background: #14171b; }
+.limit-panel-wrap { position: relative; height: 193px; }
+.limit-panel { position: relative; width: 100%; height: 100%; padding: 24px 22px 22px; overflow: hidden; border: 0; border-radius: 0; background: #14171b; color: inherit; text-align: left; cursor: pointer; }
+.limit-panel:hover:not(:disabled) { background: #171a1f; }
 .limit-panel.unavailable { opacity: 0.52; }
-.limit-top { justify-content: space-between; margin-bottom: 17px; }
+.limit-top { position: relative; z-index: 1; justify-content: space-between; margin-bottom: 17px; }
 .limit-top span { color: #abb2bc; font-size: 11px; font-weight: 750; letter-spacing: 0.07em; text-transform: uppercase; }
 .limit-top strong { font-size: 27px; font-weight: 600; letter-spacing: -0.04em; }
+.rolling-usage-value { padding-bottom: 8px; }
+.limit-value { display: flex; align-items: center; gap: 9px; }
+.limit-top .pace-chip { padding: 4px 6px; border: 1px solid #486431; border-radius: 5px; background: #1d2917; color: #b8ff69; font-size: 9px; letter-spacing: 0.04em; }
+.limit-top .pace-chip.ahead { border-color: #65333a; background: #2a191d; color: #f58a98; }
 .progress-track { height: 7px; overflow: hidden; border-radius: 10px; background: #282d34; }
 .progress-fill { height: 100%; border-radius: inherit; background: #a9f85b; box-shadow: 0 0 14px rgba(169, 248, 91, 0.18); transition: width 300ms ease; }
 .progress-fill.warning { background: #f0bf55; box-shadow: none; }
 .progress-fill.critical { background: #f06c7d; box-shadow: none; }
-.limit-meta { justify-content: space-between; margin-top: 10px; color: #707985; font-size: 10px; }
+.burndown-chart { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.burndown-history { width: 100%; height: 100%; overflow: visible; }
+.burndown-grid { stroke: #282d34; stroke-width: 1; vector-effect: non-scaling-stroke; }
+.burndown-past, .burndown-projection { fill: none; stroke: #a9f85b; stroke-width: 2; vector-effect: non-scaling-stroke; }
+.burndown-projection { opacity: 0.5; stroke-dasharray: 4 4; }
+.burndown-now { fill: #a9f85b; stroke: #14171b; stroke-width: 2; vector-effect: non-scaling-stroke; }
+.burndown-workweek { stroke: #7794bb; stroke-width: 1; stroke-dasharray: 3 3; vector-effect: non-scaling-stroke; }
+.burndown-workweek.end { stroke: #a47f9d; }
+.workweek-toggle { position: absolute; z-index: 2; right: 10px; bottom: 10px; display: grid; width: 26px; height: 26px; padding: 5px; place-items: center; border: 1px solid #3a414b; border-radius: 7px; background: #1a1e24; color: #87909c; cursor: pointer; }
+.workweek-toggle:hover { border-color: #657080; color: #d6dbe1; }
+.workweek-toggle.on { border-color: #729749; background: #26331d; color: #b8ff69; }
+.workweek-toggle svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.burndown-unavailable { display: grid; height: 68px; place-items: center; color: #707985; font-size: 11px; }
+.limit-meta { position: relative; z-index: 1; justify-content: space-between; margin-top: 10px; color: #707985; font-size: 10px; }
 .reset-time { display: inline-flex; align-items: baseline; gap: 5px; color: #aeb5bf; }
 .reset-time .reset-label { font-size: 11px; }
 .reset-time strong { color: #d9dde2; font-size: 16px; font-weight: 650; }

@@ -8,7 +8,7 @@ mod storage;
 
 use std::str::FromStr;
 
-use chrono::{Local, TimeZone};
+use chrono::{Datelike, Local, TimeZone, Weekday};
 use dioxus::desktop::{
     Config, WindowBuilder, WindowCloseBehaviour,
     trayicon::{default_tray_icon, init_tray_icon},
@@ -19,7 +19,7 @@ use tokio::time::{Duration, sleep};
 use codex::AccountSnapshot;
 use domain::{
     Account, DEFAULT_REFRESH_INTERVAL_SECS, DailyTime, LimitWindow, UsageWindows, WarmReason,
-    format_reset, next_slot, plan_warmup, schedule_gap_warning,
+    WindowHistory, format_reset, next_slot, plan_warmup, schedule_gap_warning,
 };
 use storage::{Store, new_account_id};
 
@@ -364,12 +364,22 @@ fn App() -> Element {
                                         LimitPanel {
                                             label: "5h burst".to_string(),
                                             window: limits.session,
-                                            now: *now.read()
+                                            history: view.account.usage_history.session.clone(),
+                                            fallback_history: Some(view.account.usage_history.weekly.clone()),
+                                            now: *now.read(),
+                                            account_id: None,
+                                            show_workweek_lines: false,
+                                            state
                                         }
                                         LimitPanel {
                                             label: "Weekly".to_string(),
                                             window: limits.weekly,
-                                            now: *now.read()
+                                            history: view.account.usage_history.weekly.clone(),
+                                            fallback_history: None,
+                                            now: *now.read(),
+                                            account_id: Some(id.clone()),
+                                            show_workweek_lines: view.account.usage_history.weekly.show_workweek_lines,
+                                            state
                                         }
                                     }
 
@@ -635,8 +645,19 @@ fn SummaryCard(value: String, label: String) -> Element {
 }
 
 #[component]
-fn LimitPanel(label: String, window: Option<LimitWindow>, now: i64) -> Element {
+fn LimitPanel(
+    label: String,
+    window: Option<LimitWindow>,
+    history: WindowHistory,
+    fallback_history: Option<WindowHistory>,
+    now: i64,
+    account_id: Option<String>,
+    show_workweek_lines: bool,
+    state: Signal<AppState>,
+) -> Element {
+    let mut show_burndown = use_signal(|| false);
     if let Some(window) = window {
+        let toggle_id = account_id.clone();
         let remaining = window.remaining_percent();
         let progress_class = if remaining <= 10 {
             "progress-fill critical"
@@ -647,37 +668,151 @@ fn LimitPanel(label: String, window: Option<LimitWindow>, now: i64) -> Element {
         };
         let reset = format_reset(window.resets_at, now);
         let reset_time = reset.strip_prefix("Resets in ");
+        let burndown = burndown(&window, &history);
+        let pace = burndown
+            .as_ref()
+            .and_then(|chart| chart.pace_delta.map(pace));
         rsx! {
-            section { class: "limit-panel",
+            div { class: "limit-panel-wrap",
+                button {
+                    class: "limit-panel",
+                    aria_label: "Toggle {label} burndown chart",
+                    aria_pressed: "{show_burndown}",
+                    onclick: move |_| show_burndown.toggle(),
                 div { class: "limit-top",
                     span { "{label}" }
-                    strong { "{remaining}%" }
+                    div { class: "limit-value",
+                        if let Some((pace_label, pace_delta)) = pace {
+                            span {
+                                class: if pace_delta < 0 { "pace-chip ahead" } else { "pace-chip" },
+                                "{pace_label} {pace_delta:+}%"
+                            }
+                        }
+                        strong { "{remaining}%" }
+                    }
                 }
-                div {
-                    class: "progress-track",
-                    role: "progressbar",
-                    aria_label: "{label} remaining",
-                    aria_valuemin: "0",
-                    aria_valuemax: "100",
-                    aria_valuenow: "{remaining}",
-                    div { class: "{progress_class}", style: "width: {remaining}%" }
+                if *show_burndown.read() {
+                    if let Some(chart) = burndown {
+                        {
+                            let latest = chart.points.last().copied();
+                            let chart_projection = chart.projected_used.clamp(0, 100);
+                            let projection_x = chart.projection_x;
+                            let history_points = chart.points
+                                .iter()
+                                .map(|(x, y)| format!("{x},{y}"))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            let workweek_lines = account_id
+                                .as_ref()
+                                .filter(|_| show_workweek_lines)
+                                .map(|_| workweek_lines(chart.start, chart.end))
+                                .unwrap_or_default();
+                            rsx! {
+                                svg {
+                                    class: "burndown-chart",
+                                    role: "img",
+                                    title { "{label} quota burndown" }
+                                    line { class: "burndown-grid", x1: "0%", y1: "50%", x2: "100%", y2: "50%" }
+                                    line { class: "burndown-grid", x1: "50%", y1: "0%", x2: "50%", y2: "100%" }
+                                    for (x, class) in workweek_lines {
+                                        line { class: "burndown-workweek {class}", x1: "{x}%", y1: "0%", x2: "{x}%", y2: "100%" }
+                                    }
+                                    svg {
+                                        class: "burndown-history",
+                                        view_box: "0 0 100 100",
+                                        preserve_aspect_ratio: "none",
+                                        polyline {
+                                            class: "burndown-past",
+                                            points: "{history_points}"
+                                        }
+                                    }
+                                    if let Some((x, y)) = latest {
+                                        line {
+                                            class: "burndown-projection",
+                                            x1: "{x}%",
+                                            y1: "{y}%",
+                                            x2: "{projection_x}%",
+                                            y2: "{chart_projection}%"
+                                        }
+                                        circle { class: "burndown-now", cx: "{x}%", cy: "{y}%", r: "3" }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        div { class: "burndown-unavailable", "Reset timing unavailable" }
+                    }
+                } else {
+                    div {
+                        class: "progress-track",
+                        role: "progressbar",
+                        aria_label: "{label} remaining",
+                        aria_valuemin: "0",
+                        aria_valuemax: "100",
+                        aria_valuenow: "{remaining}",
+                        div { class: "{progress_class}", style: "width: {remaining}%" }
+                    }
                 }
-                div { class: "limit-meta",
-                    span { "Remaining" }
-                    span { class: "reset-time",
-                        if let Some(reset_time) = reset_time {
-                            span { class: "reset-label", "Resets in" }
-                            strong { "{reset_time}" }
-                        } else {
-                            strong { "{reset}" }
+                    div { class: "limit-meta",
+                        span { if *show_burndown.read() { "Burndown" } else { "Remaining" } }
+                        span { class: "reset-time",
+                            if let Some(reset_time) = reset_time {
+                                span { class: "reset-label", "Resets in" }
+                                strong { "{reset_time}" }
+                            } else {
+                                strong { "{reset}" }
+                            }
+                        }
+                    }
+                }
+                if *show_burndown.read() && let Some(toggle_id) = toggle_id {
+                    button {
+                        class: if show_workweek_lines { "workweek-toggle on" } else { "workweek-toggle" },
+                        title: "Toggle workweek lines",
+                        aria_label: "Toggle workweek lines",
+                        aria_pressed: "{show_workweek_lines}",
+                        onclick: move |_| toggle_workweek_lines(state, &toggle_id),
+                        svg { view_box: "0 0 24 24",
+                            path { d: "M7 3v3M17 3v3M4 9h16M5 5h14a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Z" }
                         }
                     }
                 }
             }
         }
+    } else if let Some(chart) = fallback_history.and_then(|history| rolling_usage(&history, now)) {
+        let history_points = chart
+            .points
+            .iter()
+            .map(|(x, y)| format!("{x},{y}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        rsx! {
+            button { class: "limit-panel", disabled: true,
+                div { class: "limit-top",
+                    span { "5h usage" }
+                    strong { class: "rolling-usage-value", "{chart.used_percent}%" }
+                }
+                svg {
+                    class: "burndown-chart",
+                    role: "img",
+                    title { "Weekly quota usage over the last 5 hours" }
+                    line { class: "burndown-grid", x1: "0%", y1: "50%", x2: "100%", y2: "50%" }
+                    line { class: "burndown-grid", x1: "50%", y1: "0%", x2: "50%", y2: "100%" }
+                    svg {
+                        class: "burndown-history",
+                        view_box: "0 0 100 100",
+                        preserve_aspect_ratio: "none",
+                        polyline { class: "burndown-past", points: "{history_points}" }
+                    }
+                }
+                div { class: "limit-meta",
+                    span { "Weekly quota change" }
+                }
+            }
+        }
     } else {
         rsx! {
-            section { class: "limit-panel unavailable",
+            button { class: "limit-panel unavailable", disabled: true,
                 div { class: "limit-top",
                     span { "{label}" }
                     strong { "—" }
@@ -694,6 +829,250 @@ fn LimitPanel(label: String, window: Option<LimitWindow>, now: i64) -> Element {
     }
 }
 
+struct RollingUsage {
+    points: Vec<(f64, i32)>,
+    used_percent: i32,
+}
+
+fn rolling_usage(history: &WindowHistory, now: i64) -> Option<RollingUsage> {
+    const FIVE_HOURS: i64 = 5 * 60 * 60;
+
+    let cutoff = now - FIVE_HOURS;
+    if history.points.iter().rfind(|point| point.at <= now)?.at < cutoff {
+        return None;
+    }
+    let baseline = history
+        .points
+        .iter()
+        .take_while(|point| point.at <= cutoff)
+        .last()
+        .or_else(|| history.points.iter().find(|point| point.at <= now))?;
+    let observations = std::iter::once(baseline)
+        .chain(
+            history
+                .points
+                .iter()
+                .filter(|point| point.at > baseline.at && point.at <= now),
+        )
+        .collect::<Vec<_>>();
+    let latest = observations.last()?;
+    Some(RollingUsage {
+        points: observations
+            .iter()
+            .map(|point| {
+                (
+                    ((point.at - cutoff) as f64 * 100.0 / FIVE_HOURS as f64).clamp(0.0, 100.0),
+                    point.used_percent,
+                )
+            })
+            .collect(),
+        used_percent: (latest.used_percent - baseline.used_percent).max(0),
+    })
+}
+
+struct Burndown {
+    points: Vec<(f64, i32)>,
+    projected_used: i32,
+    projection_x: f64,
+    pace_delta: Option<i32>,
+    start: i64,
+    end: i64,
+}
+
+fn burndown(window: &LimitWindow, history: &WindowHistory) -> Option<Burndown> {
+    let duration = window.window_duration_mins? * 60;
+    if duration <= 0 {
+        return None;
+    }
+    let reset = window.resets_at?;
+    let start = reset - duration;
+    let active_start = history
+        .points
+        .windows(2)
+        .position(|pair| pair[1].used_percent > pair[0].used_percent)
+        .unwrap_or_else(|| history.points.len().saturating_sub(1));
+    let observations = &history.points[active_start..];
+    let points = observations
+        .iter()
+        .map(|point| {
+            (
+                ((point.at - start) as f64 * 100.0 / duration as f64).clamp(0.0, 100.0),
+                point.used_percent,
+            )
+        })
+        .collect::<Vec<_>>();
+    let first = observations.first()?;
+    let last = observations.last()?;
+    let observed_seconds = last.at - first.at;
+    let observed_usage = last.used_percent - first.used_percent;
+    let projected_used = if observed_seconds > 0 && observed_usage > 0 {
+        last.used_percent
+            + (i64::from(observed_usage) * (reset - last.at).max(0) / observed_seconds) as i32
+    } else {
+        last.used_percent
+    }
+    .max(last.used_percent);
+    let runout = (observed_seconds > 0 && observed_usage > 0).then(|| {
+        last.at
+            + i64::from(100 - last.used_percent).max(0) * observed_seconds
+                / i64::from(observed_usage)
+    });
+    let pace_delta =
+        runout.map(|runout| (((runout - reset) * 100 / duration).clamp(-999, 999)) as i32);
+    let projection_x = runout
+        .map(|runout| ((runout - start) as f64 * 100.0 / duration as f64).clamp(0.0, 100.0))
+        .unwrap_or(100.0);
+    Some(Burndown {
+        points,
+        projected_used,
+        projection_x,
+        pace_delta,
+        start,
+        end: reset,
+    })
+}
+
+fn workweek_lines(start: i64, end: i64) -> Vec<(f64, &'static str)> {
+    let duration = end - start;
+    let Some(first_date) = Local
+        .timestamp_opt(start, 0)
+        .single()
+        .map(|at| at.date_naive())
+    else {
+        return Vec::new();
+    };
+    (0..=7)
+        .filter_map(|offset| first_date.checked_add_days(chrono::Days::new(offset)))
+        .filter_map(|date| match date.weekday() {
+            Weekday::Mon => Some((date, 9, "start")),
+            Weekday::Fri => Some((date, 17, "end")),
+            _ => None,
+        })
+        .filter_map(|(date, hour, class)| {
+            let at = Local
+                .from_local_datetime(&date.and_hms_opt(hour, 0, 0)?)
+                .earliest()?
+                .timestamp();
+            (at >= start && at <= end)
+                .then(|| (((at - start) as f64 * 100.0 / duration as f64), class))
+        })
+        .collect()
+}
+
+fn pace(delta: i32) -> (&'static str, i32) {
+    if delta >= 0 {
+        ("BEHIND", delta)
+    } else {
+        ("AHEAD", delta)
+    }
+}
+
+#[cfg(test)]
+mod chart_tests {
+    use super::*;
+
+    #[test]
+    fn projects_burndown_from_elapsed_window_time() {
+        let mut account = Account::new("one".into(), "One".into());
+        let mut window = LimitWindow {
+            used_percent: 10,
+            window_duration_mins: Some(100),
+            resets_at: Some(6_000),
+        };
+        account.record_usage(
+            &UsageWindows {
+                session: Some(window.clone()),
+                weekly: None,
+            },
+            500,
+        );
+        account.record_usage(
+            &UsageWindows {
+                session: Some(window.clone()),
+                weekly: None,
+            },
+            1_000,
+        );
+        window.used_percent = 30;
+        account.record_usage(
+            &UsageWindows {
+                session: Some(window.clone()),
+                weekly: None,
+            },
+            3_000,
+        );
+        let chart = burndown(&window, &account.usage_history.session).unwrap();
+        assert_eq!(chart.points, [(16.666666666666668, 10), (50.0, 30)]);
+        assert_eq!(chart.projected_used, 60);
+        assert_eq!(chart.projection_x, 100.0);
+        assert_eq!(chart.pace_delta, Some(66));
+        assert_eq!(pace(chart.pace_delta.unwrap()), ("BEHIND", 66));
+        assert_eq!(pace(-25), ("AHEAD", -25));
+
+        window.used_percent = 80;
+        account.record_usage(
+            &UsageWindows {
+                session: Some(window.clone()),
+                weekly: None,
+            },
+            4_000,
+        );
+        let chart = burndown(&window, &account.usage_history.session).unwrap();
+        assert!(chart.projected_used > 100);
+        assert!(chart.projection_x < 100.0);
+        assert_eq!(pace(chart.pace_delta.unwrap()).0, "AHEAD");
+
+        window.resets_at = Some(12_000);
+        account.record_usage(
+            &UsageWindows {
+                session: Some(window),
+                weekly: None,
+            },
+            6_000,
+        );
+        assert_eq!(account.usage_history.session.points.len(), 1);
+    }
+
+    #[test]
+    fn charts_weekly_usage_over_the_last_five_hours() {
+        let history = WindowHistory {
+            window_key: None,
+            points: vec![
+                domain::UsagePoint {
+                    at: 1_000,
+                    used_percent: 10,
+                },
+                domain::UsagePoint {
+                    at: 10_000,
+                    used_percent: 12,
+                },
+                domain::UsagePoint {
+                    at: 19_000,
+                    used_percent: 15,
+                },
+            ],
+            ..WindowHistory::default()
+        };
+
+        let chart = rolling_usage(&history, 20_000).unwrap();
+        assert_eq!(chart.used_percent, 5);
+        assert_eq!(
+            chart.points,
+            [(0.0, 10), (44.44444444444444, 12), (94.44444444444444, 15)]
+        );
+    }
+
+    #[test]
+    fn marks_local_workweek_boundaries() {
+        let start = Local.with_ymd_and_hms(2026, 9, 6, 0, 0, 0).unwrap();
+        let end = Local.with_ymd_and_hms(2026, 9, 13, 0, 0, 0).unwrap();
+        let lines = workweek_lines(start.timestamp(), end.timestamp());
+        assert_eq!(lines.len(), 2);
+        assert_eq!((lines[0].1, lines[1].1), ("start", "end"));
+        assert!(lines[0].0 < lines[1].0);
+    }
+}
+
 async fn login_account(mut state: Signal<AppState>, id: String) {
     let Some((store, mut account)) = begin_operation(state, &id, "Waiting for browser sign-in")
     else {
@@ -705,7 +1084,7 @@ async fn login_account(mut state: Signal<AppState>, id: String) {
     }
     match codex::login(&store.account_home(&id)).await {
         Ok(snapshot) => {
-            apply_snapshot(&mut account, &snapshot);
+            apply_snapshot(&mut account, &snapshot, Local::now().timestamp());
             account.connected = true;
             account.observe_active_windows(&snapshot.limits, Local::now().timestamp());
             finish_operation(state, &id, account, Some(snapshot.limits), None);
@@ -734,9 +1113,9 @@ async fn refresh_account(mut state: Signal<AppState>, id: String, automatic: boo
             return;
         }
     };
-    apply_snapshot(&mut account, &initial);
-    account.connected = true;
     let decision_time = Local::now();
+    apply_snapshot(&mut account, &initial, decision_time.timestamp());
+    account.connected = true;
     account.observe_active_windows(&initial.limits, decision_time.timestamp());
 
     if !automatic {
@@ -759,7 +1138,7 @@ async fn refresh_account(mut state: Signal<AppState>, id: String, automatic: boo
                 .snapshot
                 .as_ref()
                 .map(|snapshot| {
-                    apply_snapshot(&mut account, snapshot);
+                    apply_snapshot(&mut account, snapshot, completed_at);
                     account.observe_active_windows(&snapshot.limits, completed_at);
                     account.confirm_warmed_windows(&snapshot.limits, completed_at);
                     snapshot.limits.clone()
@@ -783,7 +1162,7 @@ async fn manual_warmup(mut state: Signal<AppState>, id: String) {
             let completed_at = Local::now().timestamp();
             account.record_manual_success(completed_at);
             let limits = outcome.snapshot.as_ref().map(|snapshot| {
-                apply_snapshot(&mut account, snapshot);
+                apply_snapshot(&mut account, snapshot, completed_at);
                 account.observe_active_windows(&snapshot.limits, completed_at);
                 account.confirm_warmed_windows(&snapshot.limits, completed_at);
                 snapshot.limits.clone()
@@ -874,9 +1253,10 @@ fn finish_operation(
     persist(state);
 }
 
-fn apply_snapshot(account: &mut Account, snapshot: &AccountSnapshot) {
+fn apply_snapshot(account: &mut Account, snapshot: &AccountSnapshot, now: i64) {
     account.email = snapshot.email.clone();
     account.plan = snapshot.plan.clone();
+    account.record_usage(&snapshot.limits, now);
 }
 
 fn persist(mut state: Signal<AppState>) {
@@ -914,6 +1294,19 @@ fn toggle_automatic(mut state: Signal<AppState>, id: &str) {
         .find(|view| view.account.id == id)
     {
         view.account.enabled = !view.account.enabled;
+    }
+    persist(state);
+}
+
+fn toggle_workweek_lines(mut state: Signal<AppState>, id: &str) {
+    if let Some(view) = state
+        .write()
+        .accounts
+        .iter_mut()
+        .find(|view| view.account.id == id)
+    {
+        view.account.usage_history.weekly.show_workweek_lines =
+            !view.account.usage_history.weekly.show_workweek_lines;
     }
     persist(state);
 }

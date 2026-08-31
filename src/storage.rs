@@ -231,18 +231,46 @@ pub fn new_account_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::domain::{LimitWindow, UsageWindows};
+
     use super::*;
 
     #[test]
     fn round_trips_metadata_without_touching_auth_cache() {
         let root = env::temp_dir().join(format!("codex-keep-warm-test-{}", new_account_id()));
         let store = Store::new(root.clone()).unwrap();
-        let account = Account::new("abc001".into(), "Personal".into());
+        let mut account = Account::new("abc001".into(), "Personal".into());
+        account.record_usage(
+            &UsageWindows {
+                session: Some(LimitWindow {
+                    used_percent: 20,
+                    window_duration_mins: Some(300),
+                    resets_at: Some(20_000),
+                }),
+                weekly: None,
+            },
+            10_000,
+        );
+        account.usage_history.weekly.show_workweek_lines = true;
         store.prepare_account(&account.id).unwrap();
         store
             .save_accounts(std::slice::from_ref(&account), 45)
             .unwrap();
         assert_eq!(store.load().unwrap().accounts[0].label, "Personal");
+        assert!(
+            store.load().unwrap().accounts[0]
+                .usage_history
+                .weekly
+                .show_workweek_lines
+        );
+        assert_eq!(
+            store.load().unwrap().accounts[0]
+                .usage_history
+                .session
+                .points
+                .len(),
+            1
+        );
         assert_eq!(store.load().unwrap().refresh_interval_secs, 45);
         assert!(store.account_home(&account.id).join("config.toml").exists());
         assert!(!store.account_home(&account.id).join("auth.json").exists());
