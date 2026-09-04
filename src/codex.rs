@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
     process::{Child, ChildStdin, ChildStdout, Command},
+    sync::{Semaphore, SemaphorePermit},
     time::timeout,
 };
 
@@ -12,6 +13,7 @@ use crate::domain::{RateLimitResponse, UsageWindows};
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const WARMUP_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+static CODEX_PROCESS: Semaphore = Semaphore::const_new(1);
 
 #[derive(Clone, Debug, Default)]
 pub struct AccountSnapshot {
@@ -27,6 +29,7 @@ pub struct WarmupOutcome {
 }
 
 struct AppServer {
+    _permit: SemaphorePermit<'static>,
     child: Child,
     stdin: Option<ChildStdin>,
     lines: Lines<BufReader<ChildStdout>>,
@@ -36,6 +39,10 @@ struct AppServer {
 
 impl AppServer {
     async fn start(codex_home: &Path) -> Result<Self, String> {
+        let permit = CODEX_PROCESS
+            .acquire()
+            .await
+            .map_err(|_| "Codex process queue closed".to_string())?;
         let canonical_home = codex_home
             .canonicalize()
             .map_err(|error| format!("Could not open account storage: {error}"))?;
@@ -64,6 +71,7 @@ impl AppServer {
             .take()
             .ok_or_else(|| "Codex CLI stdout was unavailable".to_string())?;
         let mut server = Self {
+            _permit: permit,
             child,
             stdin: Some(stdin),
             lines: BufReader::new(stdout).lines(),
@@ -244,7 +252,7 @@ pub async fn login(codex_home: &Path) -> Result<AccountSnapshot, String> {
     snapshot
 }
 
-// ponytail: one short-lived process per operation; keep one server per account if startup load matters.
+// Codex app-server reserves hundreds of MB; serialize short-lived processes to cap peak usage.
 pub async fn fetch_snapshot(codex_home: &Path) -> Result<AccountSnapshot, String> {
     let mut server = AppServer::start(codex_home).await?;
     let snapshot = read_snapshot(&mut server).await;
