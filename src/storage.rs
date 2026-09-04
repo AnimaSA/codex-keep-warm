@@ -7,7 +7,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::domain::{Account, AppConfig};
+use crate::domain::{Account, AppConfig, DEFAULT_REFRESH_INTERVAL_SECS};
 
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -75,7 +75,9 @@ impl Store {
         let bytes = fs::read(path).map_err(|error| format!("Could not read settings: {error}"))?;
         let mut config: AppConfig = serde_json::from_slice(&bytes)
             .map_err(|error| format!("Settings are invalid: {error}"))?;
-        config.refresh_interval_secs = config.refresh_interval_secs.clamp(5, 3600);
+        config.refresh_interval_secs = config
+            .refresh_interval_secs
+            .clamp(5, DEFAULT_REFRESH_INTERVAL_SECS);
         let mut ids = HashSet::new();
         for account in &mut config.accounts {
             validate_account_id(&account.id)?;
@@ -251,12 +253,19 @@ mod tests {
             },
             10_000,
         );
+        account.usage_history.session.show_workweek_lines = true;
         account.usage_history.weekly.show_workweek_lines = true;
         store.prepare_account(&account.id).unwrap();
         store
             .save_accounts(std::slice::from_ref(&account), 45)
             .unwrap();
         assert_eq!(store.load().unwrap().accounts[0].label, "Personal");
+        assert!(
+            store.load().unwrap().accounts[0]
+                .usage_history
+                .session
+                .show_workweek_lines
+        );
         assert!(
             store.load().unwrap().accounts[0]
                 .usage_history

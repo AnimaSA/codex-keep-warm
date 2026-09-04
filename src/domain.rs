@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub const SESSION_MINUTES: i64 = 300;
 pub const WEEK_MINUTES: i64 = 10_080;
-pub const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 30;
+pub const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 60;
 const RESET_FRESH_TOLERANCE_SECS: i64 = 300;
 const AUTO_GUARD_SECS: i64 = 120;
 const SCHEDULE_GRACE_SECS: i64 = 180;
@@ -311,13 +311,6 @@ impl LimitWindow {
             self.window_duration_mins?, self.resets_at?
         ))
     }
-
-    fn is_fresh(&self, now: i64) -> bool {
-        let (Some(duration), Some(reset)) = (self.window_duration_mins, self.resets_at) else {
-            return false;
-        };
-        reset - now >= duration * 60 - RESET_FRESH_TOLERANCE_SECS
-    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -432,7 +425,6 @@ pub fn plan_warmup<Tz: TimeZone>(
             now_ts,
         );
     }
-
     if can_retry
         && !weekly_blocked
         && let Some(slot) = due_slot(&now, &account.warmup_times)
@@ -476,8 +468,7 @@ fn candidate_key(
     if expired {
         key.push_str(":expired");
     }
-    (confirmed != Some(&key) && (expired || window.used_percent == 0 && window.is_fresh(now)))
-        .then_some(key)
+    (confirmed != Some(&key) && (expired || window.used_percent == 0)).then_some(key)
 }
 
 fn filler_is_safe<Tz: TimeZone>(
@@ -656,11 +647,47 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_slot_fires_once_inside_its_minute() {
+    fn scheduled_slot_fires_once_when_the_session_is_cold() {
         let now = local_time(13, 0);
-        let account = account_with_schedule();
-        let plan = plan_warmup(now, &account, &UsageWindows::default());
+        let mut account = account_with_schedule();
+        let windows = reset_window(now.timestamp(), SESSION_MINUTES);
+        let plan = plan_warmup(now, &account, &windows);
         assert_eq!(plan.schedule_key.as_deref(), Some("2026-08-30@13:00"));
+        assert!(plan.session_key.is_some());
+        account.record_success(&plan, now.timestamp());
+        assert!(plan_warmup(now, &account, &windows).is_empty());
+    }
+    #[test]
+    fn scheduled_slot_runs_when_session_already_confirmed() {
+        let now = local_time(13, 0);
+        let mut account = account_with_schedule();
+        let windows = reset_window(now.timestamp(), SESSION_MINUTES);
+        account.ledger.confirmed_session_key = windows
+            .session
+            .as_ref()
+            .and_then(|window| window.key("session"));
+        let plan = plan_warmup(now, &account, &windows);
+        assert_eq!(plan.schedule_key.as_deref(), Some("2026-08-30@13:00"));
+        assert!(plan.session_key.is_none());
+        account.record_success(&plan, now.timestamp());
+        assert!(plan_warmup(now, &account, &windows).is_empty());
+    }
+
+    #[test]
+    fn old_unconfirmed_windows_are_still_warmed() {
+        let now = local_time(1, 0);
+        let account = account_with_schedule();
+        let windows = UsageWindows {
+            session: reset_window(now.timestamp(), 240).session,
+            weekly: Some(LimitWindow {
+                used_percent: 0,
+                window_duration_mins: Some(WEEK_MINUTES),
+                resets_at: Some(now.timestamp() + 6 * 24 * 60 * 60),
+            }),
+        };
+        let plan = plan_warmup(now, &account, &windows);
+        assert!(plan.session_key.is_some());
+        assert!(plan.weekly_key.is_some());
     }
 
     #[test]

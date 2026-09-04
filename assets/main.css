@@ -259,6 +259,9 @@ button:focus-visible, input:focus-visible { outline: 2px solid #b8ff69; outline-
 .burndown-now { fill: #a9f85b; stroke: #14171b; stroke-width: 2; vector-effect: non-scaling-stroke; }
 .burndown-workweek { stroke: #7794bb; stroke-width: 1; stroke-dasharray: 3 3; vector-effect: non-scaling-stroke; }
 .burndown-workweek.end { stroke: #a47f9d; }
+.burndown-day-quota { stroke: #7794bb; stroke-width: 1; stroke-dasharray: 3 3; vector-effect: non-scaling-stroke; }
+.burndown-day-quota.end { stroke: #a47f9d; }
+.burndown-five-hour { stroke: #d6a85f; stroke-width: 1; stroke-dasharray: 3 3; vector-effect: non-scaling-stroke; }
 .workweek-toggle { position: absolute; z-index: 2; right: 10px; bottom: 10px; display: grid; width: 26px; height: 26px; padding: 5px; place-items: center; border: 1px solid #3a414b; border-radius: 7px; background: #1a1e24; color: #87909c; cursor: pointer; }
 .workweek-toggle:hover { border-color: #657080; color: #d6dbe1; }
 .workweek-toggle.on { border-color: #729749; background: #26331d; color: #b8ff69; }
