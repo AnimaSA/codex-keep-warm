@@ -250,11 +250,13 @@ mod tests {
                     resets_at: Some(20_000),
                 }),
                 weekly: None,
+                banked_resets: None,
             },
             10_000,
         );
         account.usage_history.session.show_workweek_lines = true;
         account.usage_history.weekly.show_workweek_lines = true;
+        account.usage_history.weekly.weekend_zero_usage = true;
         store.prepare_account(&account.id).unwrap();
         store
             .save_accounts(std::slice::from_ref(&account), 45)
@@ -271,6 +273,12 @@ mod tests {
                 .usage_history
                 .weekly
                 .show_workweek_lines
+        );
+        assert!(
+            store.load().unwrap().accounts[0]
+                .usage_history
+                .weekly
+                .weekend_zero_usage
         );
         assert_eq!(
             store.load().unwrap().accounts[0]

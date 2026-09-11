@@ -8,7 +8,7 @@ mod storage;
 
 use std::str::FromStr;
 
-use chrono::{Datelike, Local, TimeZone, Weekday};
+use chrono::{Datelike, Local, TimeZone, Timelike, Weekday};
 use dioxus::desktop::{
     Config, WindowBuilder, WindowCloseBehaviour,
     trayicon::{default_tray_icon, init_tray_icon},
@@ -18,8 +18,8 @@ use tokio::time::{Duration, interval};
 
 use codex::AccountSnapshot;
 use domain::{
-    Account, DEFAULT_REFRESH_INTERVAL_SECS, DailyTime, LimitWindow, UsageWindows, WarmReason,
-    WindowHistory, format_reset, next_slot, plan_warmup, schedule_gap_warning,
+    Account, BankedResets, DEFAULT_REFRESH_INTERVAL_SECS, DailyTime, LimitWindow, UsageWindows,
+    WarmReason, WindowHistory, format_reset, next_slot, plan_warmup, schedule_gap_warning,
 };
 use storage::{Store, new_account_id};
 
@@ -35,7 +35,11 @@ struct AccountView {
 }
 
 impl AccountView {
-    fn new(account: Account) -> Self {
+    fn new(mut account: Account) -> Self {
+        account.usage_history.session.weekend_zero_usage = false;
+        if !account.usage_history.weekly.show_workweek_lines {
+            account.usage_history.weekly.weekend_zero_usage = false;
+        }
         Self {
             account,
             limits: None,
@@ -298,6 +302,7 @@ fn App() -> Element {
                             let identity = view.account.email.clone().unwrap_or_else(|| "ChatGPT account".to_string());
                             let plan = view.account.plan.as_deref().map(plan_label).unwrap_or_else(|| "Unknown plan".to_string());
                             let limits = view.limits.clone().unwrap_or_default();
+                            let banked_resets = limits.banked_resets.as_ref().map(banked_resets_label);
                             let last_activity = last_activity(&view.account);
                             let status_text = account_status(&view, &local_now);
                             let has_gap_warning = schedule_gap_warning(&view.account.warmup_times);
@@ -311,6 +316,9 @@ fn App() -> Element {
                                                 div { class: "name-line",
                                                     h3 { "{view.account.label}" }
                                                     span { class: "plan-badge", "{plan}" }
+                                                    if let Some(banked_resets) = &banked_resets {
+                                                        span { class: "reset-badge", "{banked_resets}" }
+                                                    }
                                                     if view.busy.as_deref() == Some("Refreshing limits") {
                                                         span { class: "busy-status",
                                                             span { class: "spinner" }
@@ -666,6 +674,7 @@ fn LimitPanel(
     let mut show_today = use_signal(|| false);
     if let Some(window) = window {
         let toggle_id = account_id.clone();
+        let weekend_toggle_id = account_id.clone();
         let remaining = window.remaining_percent();
         let progress_class = if remaining <= 10 {
             "progress-fill critical"
@@ -676,7 +685,9 @@ fn LimitPanel(
         };
         let reset = format_reset(window.resets_at, now);
         let reset_time = reset.strip_prefix("Resets in ");
-        let burndown = burndown(&window, &history);
+        let weekend_zero_usage =
+            weekly_history && show_workweek_lines && history.weekend_zero_usage;
+        let burndown_chart = burndown(&window, &history, weekend_zero_usage);
         let pace = pace(&window, now);
         rsx! {
             div { class: "limit-panel-wrap",
@@ -698,11 +709,50 @@ fn LimitPanel(
                     }
                 }
                 if *show_burndown.read() {
-                    if let Some(chart) = burndown {
+                    if let Some(chart) = burndown_chart {
                         {
                             let latest = chart.points.last().copied();
-                            let chart_projection = chart.projected_used.clamp(0, 100);
-                            let projection_x = chart.projection_x;
+                            let runout_marker =
+                                |runout_at: Option<i64>, points: &[(f64, i32)], label: &str| {
+                                    runout_at
+                                        .filter(|at| *at > now && *at < chart.end)
+                                        .and_then(|at| {
+                                            let (x, used) = points.last().copied()?;
+                                            (used >= 100).then(|| {
+                                                Local.timestamp_opt(at, 0).single().map(|time| {
+                                                    (
+                                                        x,
+                                                        format!(
+                                                            "{label}: {}",
+                                                            time.format("%b %-d, %H:%M")
+                                                        ),
+                                                    )
+                                                })
+                                            })?
+                                        })
+                                };
+                            let projected_runout = runout_marker(
+                                chart.runout_at,
+                                &chart.projection_points,
+                                "Projected runout",
+                            );
+                            let recent_projected_runout = runout_marker(
+                                chart.recent_runout_at,
+                                &chart.recent_projection_points,
+                                "Trailing-hour projected runout",
+                            );
+                            let projection_points = chart
+                                .projection_points
+                                .iter()
+                                .map(|(x, y)| format!("{x},{y}"))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            let recent_projection_points = chart
+                                .recent_projection_points
+                                .iter()
+                                .map(|(x, y)| format!("{x},{y}"))
+                                .collect::<Vec<_>>()
+                                .join(" ");
                             let history_points = chart.points
                                 .iter()
                                 .map(|(x, y)| format!("{x},{y}"))
@@ -719,6 +769,17 @@ fn LimitPanel(
                                     }
                                 })
                                 .unwrap_or_default();
+                            let weekly_runout_y = fallback_window
+                                .as_ref()
+                                .zip(fallback_history.as_ref())
+                                .and_then(|(window, history)| {
+                                    burndown(
+                                        window,
+                                        history,
+                                        history.show_workweek_lines && history.weekend_zero_usage,
+                                    )
+                                })
+                                .and_then(|weekly| weekly_runout_line(&chart, &weekly, now));
                             rsx! {
                                 svg {
                                     class: "burndown-chart",
@@ -726,6 +787,9 @@ fn LimitPanel(
                                     title { "{label} quota burndown" }
                                     line { class: "burndown-grid", x1: "0%", y1: "50%", x2: "100%", y2: "50%" }
                                     line { class: "burndown-grid", x1: "50%", y1: "0%", x2: "50%", y2: "100%" }
+                                    if let Some(y) = weekly_runout_y {
+                                        line { class: "burndown-weekly-runout", x1: "0%", y1: "{y}%", x2: "100%", y2: "{y}%" }
+                                    }
                                     for (x, class) in workweek_lines {
                                         line { class: "burndown-workweek {class}", x1: "{x}%", y1: "0%", x2: "{x}%", y2: "100%" }
                                     }
@@ -738,15 +802,52 @@ fn LimitPanel(
                                             points: "{history_points}"
                                         }
                                     }
-                                    if let Some((x, y)) = latest {
-                                        line {
-                                            class: "burndown-projection",
-                                            x1: "{x}%",
-                                            y1: "{y}%",
-                                            x2: "{projection_x}%",
-                                            y2: "{chart_projection}%"
+                                    if !projection_points.is_empty() {
+                                        svg {
+                                            class: "burndown-history",
+                                            view_box: "0 0 100 100",
+                                            preserve_aspect_ratio: "none",
+                                            polyline {
+                                                class: "burndown-projection",
+                                                points: "{projection_points}"
+                                            }
                                         }
+                                    }
+                                    if !recent_projection_points.is_empty() {
+                                        svg {
+                                            class: "burndown-history",
+                                            view_box: "0 0 100 100",
+                                            preserve_aspect_ratio: "none",
+                                            polyline {
+                                                class: "burndown-projection recent",
+                                                points: "{recent_projection_points}"
+                                            }
+                                        }
+                                    }
+                                    if let Some((x, y)) = latest {
                                         circle { class: "burndown-now", cx: "{x}%", cy: "{y}%", r: "3" }
+                                    }
+                                }
+                                if let Some((x, tooltip)) = projected_runout {
+                                    div {
+                                        class: "burndown-runout",
+                                        style: "left: {x}%;"
+                                    }
+                                    div {
+                                        class: "burndown-runout-tooltip",
+                                        style: "left: clamp(88px, {x}%, calc(100% - 88px));",
+                                        "{tooltip}"
+                                    }
+                                }
+                                if let Some((x, tooltip)) = recent_projected_runout {
+                                    div {
+                                        class: "burndown-runout",
+                                        style: "left: {x}%;"
+                                    }
+                                    div {
+                                        class: "burndown-runout-tooltip",
+                                        style: "left: clamp(88px, {x}%, calc(100% - 88px));",
+                                        "{tooltip}"
                                     }
                                 }
                             }
@@ -786,6 +887,18 @@ fn LimitPanel(
                         onclick: move |_| toggle_workweek_lines(state, &toggle_id, weekly_history),
                         svg { view_box: "0 0 24 24",
                             path { d: "M7 3v3M17 3v3M4 9h16M5 5h14a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Z" }
+                        }
+                    }
+                    if weekly_history && show_workweek_lines && let Some(weekend_toggle_id) = weekend_toggle_id {
+                        button {
+                            class: if weekend_zero_usage { "workweek-toggle weekend-toggle on" } else { "workweek-toggle weekend-toggle" },
+                            title: "Toggle pause outside workweek",
+                            aria_label: "Toggle pause outside workweek",
+                            aria_pressed: "{weekend_zero_usage}",
+                            onclick: move |_| toggle_weekend_zero_usage(state, &weekend_toggle_id),
+                            svg { view_box: "0 0 24 24",
+                                path { d: "M8 5v14M16 5v14" }
+                            }
                         }
                     }
                 }
@@ -1021,13 +1134,43 @@ fn five_hours_ago_line(now: i64) -> Option<f64> {
 
 struct Burndown {
     points: Vec<(f64, i32)>,
+    projection_points: Vec<(f64, i32)>,
+    recent_projection_points: Vec<(f64, i32)>,
     projected_used: i32,
-    projection_x: f64,
     start: i64,
     end: i64,
+    runout_at: Option<i64>,
+    recent_runout_at: Option<i64>,
 }
 
-fn burndown(window: &LimitWindow, history: &WindowHistory) -> Option<Burndown> {
+fn weekly_runout_line(session: &Burndown, weekly: &Burndown, now: i64) -> Option<f64> {
+    let runout_at = weekly.runout_at?;
+    let (last_x, last_used) = *session.points.last()?;
+    if weekly.points.last()?.1 >= 100
+        || runout_at >= weekly.end
+        || runout_at <= now
+        || weekly.end <= now
+        || session.end <= now
+        || last_x >= 100.0
+        || session.projected_used <= last_used
+    {
+        return None;
+    }
+    let runout_x =
+        (runout_at as f64 - session.start as f64) * 100.0 / (session.end - session.start) as f64;
+    if runout_x <= last_x || runout_x >= 100.0 {
+        return None;
+    }
+    let runout_used = last_used as f64
+        + f64::from(session.projected_used - last_used) * (runout_x - last_x) / (100.0 - last_x);
+    (runout_used > f64::from(last_used) && runout_used <= 100.0).then_some(runout_used)
+}
+
+fn burndown(
+    window: &LimitWindow,
+    history: &WindowHistory,
+    weekend_zero_usage: bool,
+) -> Option<Burndown> {
     let duration = window.window_duration_mins? * 60;
     if duration <= 0 {
         return None;
@@ -1037,7 +1180,14 @@ fn burndown(window: &LimitWindow, history: &WindowHistory) -> Option<Burndown> {
     let active_start = history
         .points
         .windows(2)
-        .position(|pair| pair[1].used_percent > pair[0].used_percent)
+        .position(|pair| pair[0].used_percent == 0 && pair[1].used_percent > 0)
+        .map(|index| index + 1)
+        .or_else(|| {
+            history
+                .points
+                .windows(2)
+                .position(|pair| pair[1].used_percent > pair[0].used_percent)
+        })
         .unwrap_or_else(|| history.points.len().saturating_sub(1));
     let observations = &history.points[active_start..];
     let points = observations
@@ -1053,34 +1203,152 @@ fn burndown(window: &LimitWindow, history: &WindowHistory) -> Option<Burndown> {
     let last = observations.last()?;
     let observed_seconds = last.at - first.at;
     let observed_usage = last.used_percent - first.used_percent;
-    let projected_used = if observed_seconds > 0 && observed_usage > 0 {
-        last.used_percent
-            + (i64::from(observed_usage) * (reset - last.at).max(0) / observed_seconds) as i32
-    } else {
-        last.used_percent
-    }
-    .max(last.used_percent);
+    let (projected_used, forecast_runout, projected) = project_usage(
+        last.at,
+        last.used_percent,
+        reset,
+        observed_seconds,
+        observed_usage,
+        weekend_zero_usage,
+    );
     let runout = history
         .points
         .iter()
         .find(|point| point.used_percent >= 100)
         .map(|point| point.at)
-        .or_else(|| {
-            (observed_seconds > 0 && observed_usage > 0).then(|| {
-                last.at
-                    + i64::from(100 - last.used_percent).max(0) * observed_seconds
-                        / i64::from(observed_usage)
-            })
-        });
-    let projection_x = runout
-        .map(|runout| ((runout - start) as f64 * 100.0 / duration as f64).clamp(0.0, 100.0))
-        .unwrap_or(100.0);
+        .or(forecast_runout);
+    let to_chart_point = |(at, used): (i64, i32)| {
+        (
+            ((at - start) as f64 * 100.0 / duration as f64).clamp(0.0, 100.0),
+            used.clamp(0, 100),
+        )
+    };
+    let projection_points = std::iter::once((first.at, first.used_percent))
+        .chain(projected)
+        .map(to_chart_point)
+        .collect();
+    let recent_start = last.at - 60 * 60;
+    let recent_first = observations
+        .iter()
+        .take_while(|point| point.at <= recent_start)
+        .last()
+        .unwrap_or(first);
+    let (_, recent_runout_at, recent_projected) = project_usage(
+        last.at,
+        last.used_percent,
+        reset,
+        last.at - recent_first.at,
+        last.used_percent - recent_first.used_percent,
+        weekend_zero_usage,
+    );
+    let recent_projection_points = recent_projected.into_iter().map(to_chart_point).collect();
     Some(Burndown {
         points,
+        projection_points,
+        recent_projection_points,
         projected_used,
-        projection_x,
         start,
         end: reset,
+        runout_at: runout,
+        recent_runout_at,
+    })
+}
+
+fn project_usage(
+    last_at: i64,
+    last_used: i32,
+    reset: i64,
+    observed_seconds: i64,
+    observed_usage: i32,
+    pause_outside_workweek: bool,
+) -> (i32, Option<i64>, Vec<(i64, i32)>) {
+    let mut points = vec![(last_at, last_used)];
+    if reset <= last_at || observed_seconds <= 0 || observed_usage <= 0 {
+        if reset > last_at {
+            points.push((reset, last_used));
+        }
+        return (last_used, None, points);
+    }
+
+    let boundaries = projection_boundaries(last_at, reset, pause_outside_workweek);
+    let mut cursor = last_at;
+    let mut active_seconds = 0;
+    let needed_active_seconds =
+        i64::from(100 - last_used).max(0) * observed_seconds / i64::from(observed_usage);
+    let mut runout = None;
+    for boundary in &boundaries {
+        let segment_seconds = boundary - cursor;
+        if !pause_outside_workweek || !outside_work_hours(cursor) {
+            let previous_active = active_seconds;
+            active_seconds += segment_seconds;
+            if runout.is_none() && active_seconds >= needed_active_seconds {
+                runout = Some(cursor + needed_active_seconds.saturating_sub(previous_active));
+            }
+        }
+        cursor = *boundary;
+    }
+    let projected_used =
+        last_used + (i64::from(observed_usage) * active_seconds / observed_seconds) as i32;
+
+    cursor = last_at;
+    active_seconds = 0;
+    for boundary in boundaries {
+        if !pause_outside_workweek || !outside_work_hours(cursor) {
+            active_seconds += boundary - cursor;
+        }
+        if let Some(runout_at) = runout
+            && runout_at <= boundary
+        {
+            points.push((runout_at, 100));
+            break;
+        }
+        points.push((
+            boundary,
+            last_used + (i64::from(observed_usage) * active_seconds / observed_seconds) as i32,
+        ));
+        cursor = boundary;
+    }
+    (projected_used.max(last_used), runout, points)
+}
+
+fn projection_boundaries(start: i64, end: i64, pause_outside_workweek: bool) -> Vec<i64> {
+    let mut boundaries = Vec::new();
+    if pause_outside_workweek
+        && let (Some(first), Some(last)) = (
+            Local.timestamp_opt(start, 0).single(),
+            Local.timestamp_opt(end, 0).single(),
+        )
+    {
+        let first_date = first.date_naive();
+        let days = (last.date_naive() - first_date).num_days().max(0) as u64;
+        for date in
+            (0..=days).filter_map(|offset| first_date.checked_add_days(chrono::Days::new(offset)))
+        {
+            if matches!(date.weekday(), Weekday::Sat | Weekday::Sun) {
+                continue;
+            }
+            for hour in [9, 17] {
+                if let Some(at) = date
+                    .and_hms_opt(hour, 0, 0)
+                    .and_then(|time| Local.from_local_datetime(&time).earliest())
+                    .map(|at| at.timestamp())
+                    .filter(|at| *at > start && *at < end)
+                {
+                    boundaries.push(at);
+                }
+            }
+        }
+    }
+    boundaries.push(end);
+    boundaries
+}
+
+fn outside_work_hours(at: i64) -> bool {
+    Local.timestamp_opt(at, 0).single().is_some_and(|at| {
+        !matches!(
+            at.weekday(),
+            Weekday::Mon | Weekday::Tue | Weekday::Wed | Weekday::Thu | Weekday::Fri
+        ) || !(9 * 60 * 60..17 * 60 * 60).contains(&at.num_seconds_from_midnight())
     })
 }
 
@@ -1164,6 +1432,7 @@ mod chart_tests {
             &UsageWindows {
                 session: Some(window.clone()),
                 weekly: None,
+                banked_resets: None,
             },
             500,
         );
@@ -1171,6 +1440,7 @@ mod chart_tests {
             &UsageWindows {
                 session: Some(window.clone()),
                 weekly: None,
+                banked_resets: None,
             },
             1_000,
         );
@@ -1179,13 +1449,16 @@ mod chart_tests {
             &UsageWindows {
                 session: Some(window.clone()),
                 weekly: None,
+                banked_resets: None,
             },
             3_000,
         );
-        let chart = burndown(&window, &account.usage_history.session).unwrap();
+        let chart = burndown(&window, &account.usage_history.session, false).unwrap();
         assert_eq!(chart.points, [(16.666666666666668, 10), (50.0, 30)]);
+        assert_eq!(chart.projection_points.first(), chart.points.first());
         assert_eq!(chart.projected_used, 60);
-        assert_eq!(chart.projection_x, 100.0);
+        assert_eq!(chart.projection_points.last().unwrap().0, 100.0);
+        assert_eq!(chart.recent_projection_points.first(), chart.points.last());
         assert_eq!(pace(&window, 3_000), Some(("SURPLUS", 20)));
 
         window.used_percent = 70;
@@ -1196,12 +1469,14 @@ mod chart_tests {
             &UsageWindows {
                 session: Some(window.clone()),
                 weekly: None,
+                banked_resets: None,
             },
             4_000,
         );
-        let chart = burndown(&window, &account.usage_history.session).unwrap();
+        let chart = burndown(&window, &account.usage_history.session, false).unwrap();
         assert!(chart.projected_used > 100);
-        assert!(chart.projection_x < 100.0);
+        assert!(chart.projection_points.last().unwrap().0 < 100.0);
+        assert_eq!(chart.recent_runout_at, Some(4_857));
         assert_eq!(pace(&window, 4_000), Some(("DEFICIT", -13)));
 
         window.used_percent = 100;
@@ -1209,6 +1484,7 @@ mod chart_tests {
             &UsageWindows {
                 session: Some(window.clone()),
                 weekly: None,
+                banked_resets: None,
             },
             4_500,
         );
@@ -1217,6 +1493,7 @@ mod chart_tests {
             &UsageWindows {
                 session: Some(window.clone()),
                 weekly: None,
+                banked_resets: None,
             },
             5_000,
         );
@@ -1228,10 +1505,52 @@ mod chart_tests {
             &UsageWindows {
                 session: Some(window),
                 weekly: None,
+                banked_resets: None,
             },
             6_000,
         );
         assert_eq!(account.usage_history.session.points.len(), 1);
+    }
+
+    #[test]
+    fn projects_from_first_dip_and_trailing_hour_independently() {
+        let window = LimitWindow {
+            used_percent: 12,
+            window_duration_mins: Some(210),
+            resets_at: Some(12_600),
+        };
+        let history = WindowHistory {
+            points: vec![
+                domain::UsagePoint {
+                    at: 0,
+                    used_percent: 0,
+                },
+                domain::UsagePoint {
+                    at: 600,
+                    used_percent: 0,
+                },
+                domain::UsagePoint {
+                    at: 1_200,
+                    used_percent: 1,
+                },
+                domain::UsagePoint {
+                    at: 3_000,
+                    used_percent: 2,
+                },
+                domain::UsagePoint {
+                    at: 6_600,
+                    used_percent: 12,
+                },
+            ],
+            ..WindowHistory::default()
+        };
+
+        let chart = burndown(&window, &history, false).unwrap();
+        assert_eq!(chart.points.first().unwrap().1, 1);
+        assert_eq!(chart.projection_points.first().unwrap().1, 1);
+        assert_eq!(chart.projection_points.last(), Some(&(100.0, 24)));
+        assert_eq!(chart.recent_projection_points.first(), chart.points.last());
+        assert_eq!(chart.recent_projection_points.last(), Some(&(100.0, 28)));
     }
 
     #[test]
@@ -1311,6 +1630,52 @@ mod chart_tests {
     }
 
     #[test]
+    fn maps_predicted_weekly_runout_onto_current_burst_usage() {
+        let window = LimitWindow {
+            used_percent: 0,
+            window_duration_mins: Some(100),
+            resets_at: Some(6_000),
+        };
+        let session = WindowHistory {
+            points: vec![
+                domain::UsagePoint {
+                    at: 1_200,
+                    used_percent: 20,
+                },
+                domain::UsagePoint {
+                    at: 2_400,
+                    used_percent: 40,
+                },
+            ],
+            ..WindowHistory::default()
+        };
+        let mut weekly = WindowHistory {
+            points: vec![
+                domain::UsagePoint {
+                    at: 1_200,
+                    used_percent: 80,
+                },
+                domain::UsagePoint {
+                    at: 2_400,
+                    used_percent: 90,
+                },
+            ],
+            ..WindowHistory::default()
+        };
+        let session = burndown(&window, &session, false).unwrap();
+        let weekly_chart = burndown(&window, &weekly, false).unwrap();
+        assert_eq!(
+            weekly_runout_line(&session, &weekly_chart, 2_400),
+            Some(60.0)
+        );
+        assert_eq!(weekly_runout_line(&session, &weekly_chart, 3_600), None);
+
+        weekly.points[1].used_percent = 84;
+        let weekly_chart = burndown(&window, &weekly, false).unwrap();
+        assert_eq!(weekly_runout_line(&session, &weekly_chart, 2_400), None);
+    }
+
+    #[test]
     fn marks_local_workweek_boundaries() {
         let start = Local.with_ymd_and_hms(2026, 9, 6, 0, 0, 0).unwrap();
         let end = Local.with_ymd_and_hms(2026, 9, 13, 0, 0, 0).unwrap();
@@ -1318,6 +1683,55 @@ mod chart_tests {
         assert_eq!(lines.len(), 2);
         assert_eq!((lines[0].1, lines[1].1), ("start", "end"));
         assert!(lines[0].0 < lines[1].0);
+    }
+    #[test]
+    fn pauses_weekly_projection_outside_work_hours() {
+        let friday = Local.with_ymd_and_hms(2026, 9, 4, 16, 0, 0).unwrap();
+        let monday = Local.with_ymd_and_hms(2026, 9, 7, 11, 0, 0).unwrap();
+        let (projected_used, runout, points) = project_usage(
+            friday.timestamp(),
+            30,
+            monday.timestamp(),
+            2 * 60 * 60,
+            20,
+            true,
+        );
+
+        assert_eq!(projected_used, 60);
+        assert_eq!(runout, None);
+        assert_eq!(
+            points.iter().map(|(_, used)| *used).collect::<Vec<_>>(),
+            [30, 40, 40, 60]
+        );
+
+        let tuesday = Local.with_ymd_and_hms(2026, 9, 8, 16, 0, 0).unwrap();
+        let wednesday = Local.with_ymd_and_hms(2026, 9, 9, 10, 0, 0).unwrap();
+        let (projected_used, runout, points) = project_usage(
+            tuesday.timestamp(),
+            30,
+            wednesday.timestamp(),
+            2 * 60 * 60,
+            20,
+            true,
+        );
+
+        assert_eq!(projected_used, 50);
+        assert_eq!(runout, None);
+        assert_eq!(
+            points.iter().map(|(_, used)| *used).collect::<Vec<_>>(),
+            [30, 40, 40, 50]
+        );
+    }
+    #[test]
+    fn disables_weekend_mode_without_weekly_workweek_lines() {
+        let mut account = Account::new("one".into(), "One".into());
+        account.usage_history.session.weekend_zero_usage = true;
+        account.usage_history.weekly.weekend_zero_usage = true;
+
+        let view = AccountView::new(account);
+
+        assert!(!view.account.usage_history.session.weekend_zero_usage);
+        assert!(!view.account.usage_history.weekly.weekend_zero_usage);
     }
 
     #[test]
@@ -1336,6 +1750,16 @@ mod chart_tests {
             [(60.0, "end")]
         );
         assert!(workday_lines(midday.timestamp(), midday.timestamp() + five_hours).is_empty());
+    }
+    #[test]
+    fn labels_banked_resets_without_an_expiry() {
+        assert_eq!(
+            banked_resets_label(&BankedResets {
+                available_count: 2,
+                next_expires_at: None,
+            }),
+            "2 resets"
+        );
     }
 }
 
@@ -1577,6 +2001,21 @@ fn toggle_workweek_lines(mut state: Signal<AppState>, id: &str, weekly_history: 
             &mut view.account.usage_history.session
         };
         history.show_workweek_lines = !history.show_workweek_lines;
+        if weekly_history && !history.show_workweek_lines {
+            history.weekend_zero_usage = false;
+        }
+    }
+    persist(state);
+}
+fn toggle_weekend_zero_usage(mut state: Signal<AppState>, id: &str) {
+    if let Some(view) = state
+        .write()
+        .accounts
+        .iter_mut()
+        .find(|view| view.account.id == id)
+    {
+        let history = &mut view.account.usage_history.weekly;
+        history.weekend_zero_usage = history.show_workweek_lines && !history.weekend_zero_usage;
     }
     persist(state);
 }
@@ -1669,6 +2108,19 @@ fn format_slot(timestamp: i64) -> String {
         .single()
         .map(|time| time.format("%a %H:%M").to_string())
         .unwrap_or_else(|| "Unknown".to_string())
+}
+
+fn banked_resets_label(resets: &BankedResets) -> String {
+    let count = if resets.available_count == 1 {
+        "1 reset".to_string()
+    } else {
+        format!("{} resets", resets.available_count)
+    };
+    resets
+        .next_expires_at
+        .and_then(|timestamp| Local.timestamp_opt(timestamp, 0).single())
+        .map(|expiry| format!("{count} · closest {}", expiry.format("%b %-d, %H:%M")))
+        .unwrap_or(count)
 }
 
 fn last_activity(account: &Account) -> String {

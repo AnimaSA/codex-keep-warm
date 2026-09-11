@@ -213,6 +213,7 @@ pub struct WindowHistory {
     pub window_key: Option<String>,
     pub points: Vec<UsagePoint>,
     pub show_workweek_lines: bool,
+    pub weekend_zero_usage: bool,
 }
 
 impl WindowHistory {
@@ -313,6 +314,25 @@ impl LimitWindow {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BankedResets {
+    pub available_count: u64,
+    pub next_expires_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitResetCredit {
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitResetCreditsSummary {
+    pub available_count: u64,
+    pub credits: Option<Vec<RateLimitResetCredit>>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RateLimitSnapshot {
@@ -326,16 +346,30 @@ pub struct RateLimitSnapshot {
 pub struct RateLimitResponse {
     pub rate_limits: RateLimitSnapshot,
     pub rate_limits_by_limit_id: Option<HashMap<String, RateLimitSnapshot>>,
+    pub rate_limit_reset_credits: Option<RateLimitResetCreditsSummary>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UsageWindows {
     pub session: Option<LimitWindow>,
     pub weekly: Option<LimitWindow>,
+    pub banked_resets: Option<BankedResets>,
 }
 
 impl UsageWindows {
     pub fn from_response(response: RateLimitResponse) -> Self {
+        let banked_resets = response
+            .rate_limit_reset_credits
+            .filter(|summary| summary.available_count > 0)
+            .map(|summary| BankedResets {
+                available_count: summary.available_count,
+                next_expires_at: summary
+                    .credits
+                    .iter()
+                    .flatten()
+                    .filter_map(|credit| credit.expires_at)
+                    .min(),
+            });
         let snapshot = response
             .rate_limits_by_limit_id
             .as_ref()
@@ -361,10 +395,11 @@ impl UsageWindows {
                 .cloned()
         };
 
-        let session = by_duration(SESSION_MINUTES);
-        let weekly = by_duration(WEEK_MINUTES);
-
-        Self { session, weekly }
+        Self {
+            session: by_duration(SESSION_MINUTES),
+            weekly: by_duration(WEEK_MINUTES),
+            banked_resets,
+        }
     }
 }
 
@@ -587,6 +622,7 @@ mod tests {
                 resets_at: Some(now + reset_in_minutes * 60),
             }),
             weekly: None,
+            banked_resets: None,
         }
     }
 
@@ -619,6 +655,7 @@ mod tests {
             &UsageWindows {
                 session: Some(window.clone()),
                 weekly: None,
+                banked_resets: None,
             },
             10_000,
         );
@@ -629,6 +666,7 @@ mod tests {
             &UsageWindows {
                 session: Some(window.clone()),
                 weekly: None,
+                banked_resets: None,
             },
             10_030,
         );
@@ -640,6 +678,7 @@ mod tests {
             &UsageWindows {
                 session: Some(window),
                 weekly: None,
+                banked_resets: None,
             },
             20_000,
         );
@@ -684,6 +723,7 @@ mod tests {
                 window_duration_mins: Some(WEEK_MINUTES),
                 resets_at: Some(now.timestamp() + 6 * 24 * 60 * 60),
             }),
+            banked_resets: None,
         };
         let plan = plan_warmup(now, &account, &windows);
         assert!(plan.session_key.is_some());
@@ -731,6 +771,7 @@ mod tests {
                 window_duration_mins: Some(WEEK_MINUTES),
                 resets_at: Some(now.timestamp() + WEEK_MINUTES * 60),
             }),
+            banked_resets: None,
         };
         let plan = plan_warmup(now, &account, &windows);
         assert!(plan.weekly_key.is_some());
@@ -752,6 +793,7 @@ mod tests {
         let windows = UsageWindows {
             session: None,
             weekly: Some(window),
+            banked_resets: None,
         };
         let plan = plan_warmup(now, &account, &windows);
         assert!(plan.weekly_key.as_deref().unwrap().ends_with(":expired"));
@@ -766,6 +808,7 @@ mod tests {
                 window_duration_mins: Some(WEEK_MINUTES),
                 resets_at: Some(now.timestamp() + WEEK_MINUTES * 60),
             }),
+            banked_resets: None,
         };
         account.observe_active_windows(&fresh, now.timestamp());
         assert!(plan_warmup(now, &account, &fresh).is_empty());
@@ -788,6 +831,7 @@ mod tests {
                 ..RateLimitSnapshot::default()
             },
             rate_limits_by_limit_id: None,
+            rate_limit_reset_credits: None,
         };
         let normalized = UsageWindows::from_response(response);
         assert_eq!(normalized.session.unwrap().resets_at, Some(1));
@@ -806,10 +850,34 @@ mod tests {
                 ..RateLimitSnapshot::default()
             },
             rate_limits_by_limit_id: None,
+            rate_limit_reset_credits: None,
         };
         assert_eq!(
             UsageWindows::from_response(response),
             UsageWindows::default()
+        );
+    }
+
+    #[test]
+    fn keeps_available_banked_reset_count_and_closest_expiry() {
+        let response: RateLimitResponse = serde_json::from_value(serde_json::json!({
+            "rateLimits": {},
+            "rateLimitsByLimitId": null,
+            "rateLimitResetCredits": {
+                "availableCount": 2,
+                "credits": [
+                    { "expiresAt": 200 },
+                    { "expiresAt": 100 }
+                ]
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            UsageWindows::from_response(response).banked_resets,
+            Some(BankedResets {
+                available_count: 2,
+                next_expires_at: Some(100),
+            })
         );
     }
 

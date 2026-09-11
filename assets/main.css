@@ -227,6 +227,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid #b8ff69; outline-
 .name-line h3 { max-width: 360px; margin: 0; overflow: hidden; font-size: 15px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .identity p { margin: 5px 0 0; overflow: hidden; color: #858d99; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .plan-badge { padding: 4px 7px; border: 1px solid #333a42; border-radius: 6px; color: #aeb5bf; font-size: 9px; font-weight: 750; letter-spacing: 0.06em; text-transform: uppercase; }
+.reset-badge { padding: 4px 7px; border: 1px solid #486431; border-radius: 6px; background: #1d2917; color: #b8ff69; font-size: 9px; font-weight: 750; white-space: nowrap; }
 
 .busy-line, .account-error { margin: 14px 22px 0; padding: 10px 12px; border-radius: 8px; font-size: 11px; }
 .busy-line { display: flex; align-items: center; gap: 9px; border: 1px solid #37412f; background: #192016; color: #c7e9a6; }
@@ -256,13 +257,19 @@ button:focus-visible, input:focus-visible { outline: 2px solid #b8ff69; outline-
 .burndown-grid { stroke: #282d34; stroke-width: 1; vector-effect: non-scaling-stroke; }
 .burndown-past, .burndown-projection { fill: none; stroke: #a9f85b; stroke-width: 2; vector-effect: non-scaling-stroke; }
 .burndown-projection { opacity: 0.5; stroke-dasharray: 4 4; }
+.burndown-projection.recent { stroke: #f0bf55; opacity: 0.8; stroke-dasharray: 2 3; }
 .burndown-now { fill: #a9f85b; stroke: #14171b; stroke-width: 2; vector-effect: non-scaling-stroke; }
+.burndown-runout { position: absolute; z-index: 2; bottom: 0; width: 10px; height: 10px; border: 2px solid #14171b; border-radius: 50%; background: #f06c7d; transform: translateX(-50%); }
+.burndown-runout-tooltip { position: absolute; z-index: 3; bottom: 15px; width: max-content; padding: 6px 8px; border: 1px solid #505966; border-radius: 5px; background: #20252b; color: #e8ebef; font-size: 11px; white-space: nowrap; opacity: 0; visibility: hidden; pointer-events: none; transform: translateX(-50%); }
+.burndown-runout:hover + .burndown-runout-tooltip { opacity: 1; visibility: visible; }
 .burndown-workweek { stroke: #7794bb; stroke-width: 1; stroke-dasharray: 3 3; vector-effect: non-scaling-stroke; }
 .burndown-workweek.end { stroke: #a47f9d; }
 .burndown-day-quota { stroke: #7794bb; stroke-width: 1; stroke-dasharray: 3 3; vector-effect: non-scaling-stroke; }
 .burndown-day-quota.end { stroke: #a47f9d; }
 .burndown-five-hour { stroke: #d6a85f; stroke-width: 1; stroke-dasharray: 3 3; vector-effect: non-scaling-stroke; }
+.burndown-weekly-runout { stroke: #f06c7d; stroke-width: 1; stroke-dasharray: 4 4; vector-effect: non-scaling-stroke; }
 .workweek-toggle { position: absolute; z-index: 2; right: 10px; bottom: 10px; display: grid; width: 26px; height: 26px; padding: 5px; place-items: center; border: 1px solid #3a414b; border-radius: 7px; background: #1a1e24; color: #87909c; cursor: pointer; }
+.weekend-toggle { right: 42px; }
 .workweek-toggle:hover { border-color: #657080; color: #d6dbe1; }
 .workweek-toggle.on { border-color: #729749; background: #26331d; color: #b8ff69; }
 .workweek-toggle svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }

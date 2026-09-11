@@ -5,8 +5,9 @@ A local Dioxus desktop app for viewing Codex subscription limits and aligning wa
 ## What it does
 
 - Keeps each login in its own permanent `CODEX_HOME` and Codex keyring entry.
-- Shows remaining 5-hour burst and weekly capacity with reset countdowns.
+- Shows remaining 5-hour burst and weekly capacity, reset countdowns, and available banked resets.
 - Stores daily warmup times per account in the computer's local timezone.
+- Shows average and trailing-hour burndown projections with optional zero usage outside Monday-Friday, 09:00-17:00, plus hoverable early-runout dates.
 - Starts newly reset weekly windows first, then scheduled warmups, then opportunistic 5-hour windows.
 - Starts an opportunistic 5-hour window only when its observed duration plus a two-minute guard fits before the next scheduled time.
 - Runs in the system tray; closing the window keeps the scheduler running.
