@@ -19,9 +19,9 @@ body {
 }
 
 body { min-height: 100vh; }
-button, input { font: inherit; }
+button, input, select { font: inherit; }
 button { color: inherit; }
-button:focus-visible, input:focus-visible { outline: 2px solid #b8ff69; outline-offset: 2px; }
+button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid #b8ff69; outline-offset: 2px; }
 
 .app-shell {
   width: min(1220px, calc(100% - 64px));
@@ -303,8 +303,9 @@ button:focus-visible, input:focus-visible { outline: 2px solid #b8ff69; outline-
 .empty-chip { color: #68717d; }
 .add-time { display: flex; gap: 8px; }
 
-input { min-height: 38px; padding: 0 12px; border: 1px solid #343a43; border-radius: 8px; background: #111419; color: #f1f3f4; }
-input:hover:not(:disabled) { border-color: #49515d; }
+input, select { min-height: 38px; padding: 0 12px; border: 1px solid #343a43; border-radius: 8px; background: #111419; color: #f1f3f4; }
+input:hover:not(:disabled), select:hover:not(:disabled) { border-color: #49515d; }
+select { width: 100%; }
 input[type="time"] { color-scheme: dark; font-variant-numeric: tabular-nums; }
 .add-time input { width: 125px; min-height: 32px; font-size: 11px; }
 .schedule-warning { margin: -8px 22px 18px; padding: 9px 11px; border-left: 2px solid #dca94a; background: rgba(220, 169, 74, 0.06); color: #c8ac77; font-size: 10px; }

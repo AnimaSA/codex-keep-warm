@@ -64,11 +64,20 @@ impl Default for AppConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountProvider {
+    #[default]
+    Codex,
+    Claude,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Account {
     pub id: String,
     pub label: String,
+    pub provider: AccountProvider,
     pub email: Option<String>,
     pub plan: Option<String>,
     pub connected: bool,
@@ -83,6 +92,7 @@ impl Default for Account {
         Self {
             id: String::new(),
             label: String::new(),
+            provider: AccountProvider::default(),
             email: None,
             plan: None,
             connected: false,
@@ -95,10 +105,11 @@ impl Default for Account {
 }
 
 impl Account {
-    pub fn new(id: String, label: String) -> Self {
+    pub fn new(id: String, label: String, provider: AccountProvider) -> Self {
         Self {
             id,
             label: label.trim().to_string(),
+            provider,
             ..Self::default()
         }
     }
@@ -402,6 +413,18 @@ impl UsageWindows {
         }
     }
 }
+#[derive(Clone, Debug, Default)]
+pub struct AccountSnapshot {
+    pub email: Option<String>,
+    pub plan: Option<String>,
+    pub limits: UsageWindows,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WarmupOutcome {
+    pub snapshot: Option<AccountSnapshot>,
+    pub refresh_error: Option<String>,
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WarmPlan {
@@ -607,7 +630,7 @@ mod tests {
     }
 
     fn account_with_schedule() -> Account {
-        let mut account = Account::new("one".into(), "One".into());
+        let mut account = Account::new("one".into(), "One".into(), AccountProvider::Codex);
         for value in ["08:00", "13:00", "18:00"] {
             account.add_time(value.parse().unwrap());
         }
@@ -625,10 +648,20 @@ mod tests {
             banked_resets: None,
         }
     }
+    #[test]
+    fn legacy_account_without_provider_defaults_to_codex() {
+        let account: Account = serde_json::from_value(serde_json::json!({
+            "id": "legacy",
+            "label": "Legacy",
+        }))
+        .unwrap();
+
+        assert_eq!(account.provider, AccountProvider::Codex);
+    }
 
     #[test]
     fn parses_and_sorts_daily_times() {
-        let mut account = Account::new("one".into(), "One".into());
+        let mut account = Account::new("one".into(), "One".into(), AccountProvider::Codex);
         account.add_time("18:00".parse().unwrap());
         account.add_time("08:00".parse().unwrap());
         account.add_time("08:00".parse().unwrap());
@@ -645,7 +678,7 @@ mod tests {
 
     #[test]
     fn usage_history_tolerates_reset_jitter_but_clears_for_a_new_window() {
-        let mut account = Account::new("one".into(), "One".into());
+        let mut account = Account::new("one".into(), "One".into(), AccountProvider::Codex);
         let mut window = LimitWindow {
             used_percent: 10,
             window_duration_mins: Some(SESSION_MINUTES),
@@ -693,6 +726,22 @@ mod tests {
         let plan = plan_warmup(now, &account, &windows);
         assert_eq!(plan.schedule_key.as_deref(), Some("2026-08-30@13:00"));
         assert!(plan.session_key.is_some());
+        account.record_success(&plan, now.timestamp());
+        assert!(plan_warmup(now, &account, &windows).is_empty());
+    }
+
+    #[test]
+    fn claude_scheduled_slot_without_quota_windows_fires_once() {
+        let now = local_time(13, 0);
+        let mut account = Account::new("claude".into(), "Claude".into(), AccountProvider::Claude);
+        account.add_time("13:00".parse().unwrap());
+        let windows = UsageWindows::default();
+
+        let plan = plan_warmup(now, &account, &windows);
+        assert_eq!(plan.schedule_key.as_deref(), Some("2026-08-30@13:00"));
+        assert!(plan.session_key.is_none());
+        assert!(plan.weekly_key.is_none());
+
         account.record_success(&plan, now.timestamp());
         assert!(plan_warmup(now, &account, &windows).is_empty());
     }

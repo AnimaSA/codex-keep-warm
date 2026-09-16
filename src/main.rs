@@ -1,5 +1,6 @@
 #![cfg_attr(all(target_os = "windows", not(test)), windows_subsystem = "windows")]
 
+mod claude;
 mod codex;
 mod domain;
 #[cfg(target_os = "windows")]
@@ -16,10 +17,10 @@ use dioxus::desktop::{
 use dioxus::prelude::*;
 use tokio::time::{Duration, interval};
 
-use codex::AccountSnapshot;
 use domain::{
-    Account, BankedResets, DEFAULT_REFRESH_INTERVAL_SECS, DailyTime, LimitWindow, UsageWindows,
-    WarmReason, WindowHistory, format_reset, next_slot, plan_warmup, schedule_gap_warning,
+    Account, AccountProvider, AccountSnapshot, BankedResets, DEFAULT_REFRESH_INTERVAL_SECS,
+    DailyTime, LimitWindow, UsageWindows, WarmReason, WindowHistory, format_reset, next_slot,
+    plan_warmup, schedule_gap_warning,
 };
 use storage::{Store, new_account_id};
 
@@ -31,6 +32,7 @@ struct AccountView {
     limits: Option<UsageWindows>,
     busy: Option<String>,
     error: Option<String>,
+    quota_refresh_failed: bool,
     draft_time: String,
 }
 
@@ -45,6 +47,7 @@ impl AccountView {
             limits: None,
             busy: None,
             error: None,
+            quota_refresh_failed: false,
             draft_time: "08:00".to_string(),
         }
     }
@@ -117,6 +120,7 @@ fn App() -> Element {
     let mut now = use_signal(|| Local::now().timestamp());
     let mut show_add = use_signal(|| false);
     let mut new_label = use_signal(String::new);
+    let mut new_provider = use_signal(|| AccountProvider::Codex);
     let mut new_times = use_signal(|| {
         [
             "08:00".to_string(),
@@ -188,6 +192,15 @@ fn App() -> Element {
         .min_by_key(|slot| slot.at)
         .map(|slot| format_slot(slot.at))
         .unwrap_or_else(|| "No times set".to_string());
+    let selected_provider = *new_provider.read();
+    let provider_copy = match &selected_provider {
+        AccountProvider::Codex => {
+            "Codex opens ChatGPT in your browser and stores this login under its own account directory."
+        }
+        AccountProvider::Claude => {
+            "Claude opens Claude Code in your browser and stores this login under its own config directory. Claude OAuth quota refreshes from Claude's usage endpoint."
+        }
+    };
 
     rsx! {
         document::Title { "Codex Keep Warm" }
@@ -198,7 +211,7 @@ fn App() -> Element {
                     div { class: "brand-mark", "CK" }
                     div {
                         strong { "Codex Keep Warm" }
-                        span { "Local account scheduler" }
+                        span { "Local Codex and Claude scheduler" }
                     }
                 }
                 div { class: "top-actions",
@@ -211,6 +224,7 @@ fn App() -> Element {
                         class: "button primary",
                         onclick: move |_| {
                             form_error.set(None);
+                            new_provider.set(AccountProvider::Codex);
                             show_add.set(true);
                         },
                         "+ Add account"
@@ -221,9 +235,9 @@ fn App() -> Element {
             section { class: "hero",
                 div {
                     p { class: "eyebrow", "Quota alignment" }
-                    h1 { "Codex limits, lined up." }
+                    h1 { "Codex and Claude, lined up." }
                     p { class: "hero-copy",
-                        "Scheduled warmups and reset-driven starts share one guard, per account."
+                        "Scheduled warmups share one guard per account. Claude OAuth quota drives reset-driven and opportunistic warmups when usage windows are available; refresh failures stay visible without disconnecting identity."
                     }
                 }
                 div { class: "summary-grid",
@@ -250,13 +264,17 @@ fn App() -> Element {
                         div { class: "empty-core", "5h" }
                     }
                     p { class: "eyebrow", "No accounts yet" }
-                    h2 { "Add your first ChatGPT account" }
+                    h2 { "Add your first Codex or Claude account" }
                     p {
-                        "A browser sign-in creates a separate Codex credential store. Your active Codex login stays untouched."
+                        "A browser sign-in creates separate provider storage. Existing Codex and Claude logins stay untouched."
                     }
                     button {
                         class: "button primary large",
-                        onclick: move |_| show_add.set(true),
+                        onclick: move |_| {
+                            form_error.set(None);
+                            new_provider.set(AccountProvider::Codex);
+                            show_add.set(true);
+                        },
                         "Add account"
                     }
                 }
@@ -299,12 +317,14 @@ fn App() -> Element {
                             let busy = view.busy.is_some();
                             let is_pending_delete = pending_delete.read().as_deref() == Some(&id);
                             let initials = initials(&view.account.label);
-                            let identity = view.account.email.clone().unwrap_or_else(|| "ChatGPT account".to_string());
+                            let provider_label = provider_name(&view.account.provider);
+                            let identity = view.account.email.clone().unwrap_or_else(|| format!("{provider_label} account"));
                             let plan = view.account.plan.as_deref().map(plan_label).unwrap_or_else(|| "Unknown plan".to_string());
                             let limits = view.limits.clone().unwrap_or_default();
                             let banked_resets = limits.banked_resets.as_ref().map(banked_resets_label);
                             let last_activity = last_activity(&view.account);
                             let status_text = account_status(&view, &local_now);
+                            let refresh_status = refresh_action(view.account.provider);
                             let has_gap_warning = schedule_gap_warning(&view.account.warmup_times);
 
                             rsx! {
@@ -315,14 +335,15 @@ fn App() -> Element {
                                             div {
                                                 div { class: "name-line",
                                                     h3 { "{view.account.label}" }
+                                                    span { class: "plan-badge", "{provider_label}" }
                                                     span { class: "plan-badge", "{plan}" }
                                                     if let Some(banked_resets) = &banked_resets {
                                                         span { class: "reset-badge", "{banked_resets}" }
                                                     }
-                                                    if view.busy.as_deref() == Some("Refreshing limits") {
+                                                    if view.busy.as_deref() == Some(refresh_status) {
                                                         span { class: "busy-status",
                                                             span { class: "spinner" }
-                                                            "Refreshing limits"
+                                                            "{refresh_status}"
                                                         }
                                                     }
                                                 }
@@ -358,7 +379,7 @@ fn App() -> Element {
                                     }
 
                                     if let Some(action) = &view.busy
-                                        && action != "Refreshing limits"
+                                        && action != refresh_status
                                     {
                                         div { class: "busy-line",
                                             span { class: "spinner" }
@@ -372,6 +393,7 @@ fn App() -> Element {
                                     div { class: "limit-grid",
                                         LimitPanel {
                                             label: "5h burst".to_string(),
+                                            provider: view.account.provider,
                                             window: limits.session,
                                             history: view.account.usage_history.session.clone(),
                                             fallback_history: Some(view.account.usage_history.weekly.clone()),
@@ -384,6 +406,7 @@ fn App() -> Element {
                                         }
                                         LimitPanel {
                                             label: "Weekly".to_string(),
+                                            provider: view.account.provider,
                                             window: limits.weekly,
                                             history: view.account.usage_history.weekly.clone(),
                                             fallback_history: None,
@@ -409,7 +432,13 @@ fn App() -> Element {
                                                     span {}
                                                 }
                                             }
-                                            p { "Local time. Weekly resets always take priority." }
+                                            p {
+                                                if matches!(&view.account.provider, AccountProvider::Codex) {
+                                                    "Local time. Weekly resets always take priority."
+                                                } else {
+                                                    "Local time. Claude OAuth quota drives reset-driven and opportunistic warmups when usage windows are available."
+                                                }
+                                            }
                                         }
                                         div { class: "time-editor",
                                             div { class: "time-chips",
@@ -466,7 +495,13 @@ fn App() -> Element {
                                         }
                                         if is_pending_delete {
                                             div { class: "delete-confirm",
-                                                span { "Remove credentials and this account?" }
+                                                span {
+                                                    if matches!(&view.account.provider, AccountProvider::Codex) {
+                                                        "Remove Codex credentials and this account?"
+                                                    } else {
+                                                        "Remove Claude config and this account?"
+                                                    }
+                                                }
                                                 button {
                                                     class: "button danger compact",
                                                     disabled: busy,
@@ -499,7 +534,7 @@ fn App() -> Element {
             }
 
             footer { class: "app-footer",
-                span { "Credentials are isolated per account by Codex." }
+                span { "Account storage stays isolated for Codex and Claude." }
                 span { "Close hides to the tray. Click the tray icon to reopen." }
             }
         }
@@ -519,8 +554,23 @@ fn App() -> Element {
                             "×"
                         }
                     }
-                    p { class: "modal-copy",
-                        "Codex opens ChatGPT in your browser and stores this login under its own account directory."
+                    p { class: "modal-copy", "{provider_copy}" }
+                    label { class: "field",
+                        span { "Provider" }
+                        select {
+                            value: if matches!(&selected_provider, AccountProvider::Claude) { "claude" } else { "codex" },
+                            aria_label: "Account provider",
+                            onchange: move |event| {
+                                new_provider.set(if event.value() == "claude" {
+                                    AccountProvider::Claude
+                                } else {
+                                    AccountProvider::Codex
+                                });
+                                form_error.set(None);
+                            },
+                            option { value: "codex", "Codex" }
+                            option { value: "claude", "Claude" }
+                        }
                     }
                     label { class: "field",
                         span { "Account label" }
@@ -575,17 +625,19 @@ fn App() -> Element {
                                 };
                                 let Some(store) = state.read().store.clone() else { return };
                                 let id = new_account_id();
-                                if let Err(error) = store.prepare_account(&id) {
+                                let provider = selected_provider;
+                                if let Err(error) = store.prepare_account(&id, provider) {
                                     form_error.set(Some(error));
                                     return;
                                 }
-                                let mut account = Account::new(id.clone(), label);
+                                let mut account = Account::new(id.clone(), label, provider);
                                 for time in times {
                                     account.add_time(time);
                                 }
                                 state.write().accounts.push(AccountView::new(account));
                                 persist(state);
                                 new_label.set(String::new());
+                                new_provider.set(AccountProvider::Codex);
                                 new_times.set(["08:00".into(), "13:00".into(), "18:00".into()]);
                                 form_error.set(None);
                                 show_add.set(false);
@@ -660,6 +712,7 @@ fn SummaryCard(value: String, label: String) -> Element {
 #[component]
 fn LimitPanel(
     label: String,
+    provider: AccountProvider,
     window: Option<LimitWindow>,
     history: WindowHistory,
     fallback_history: Option<WindowHistory>,
@@ -904,7 +957,9 @@ fn LimitPanel(
                 }
             }
         }
-    } else if let Some(history) = fallback_history {
+    } else if matches!(provider, AccountProvider::Codex)
+        && let Some(history) = fallback_history
+    {
         let showing_today = *show_today.read();
         let chart = if showing_today {
             today_usage(&history, now)
@@ -937,7 +992,7 @@ fn LimitPanel(
             .then(|| {
                 fallback_window
                     .as_ref()
-                    .and_then(|window| daily_quota_lines(window, now))
+                    .and_then(|window| daily_quota_lines(window, now, show_workweek_lines))
             })
             .flatten();
         let five_hours_ago = showing_today.then(|| five_hours_ago_line(now)).flatten();
@@ -1018,6 +1073,10 @@ fn LimitPanel(
             }
         }
     } else {
+        let unavailable_detail = match provider {
+            AccountProvider::Codex => "Refresh after sign-in",
+            AccountProvider::Claude => "Claude OAuth quota unavailable",
+        };
         rsx! {
             button { class: "limit-panel unavailable", disabled: true,
                 div { class: "limit-top",
@@ -1029,7 +1088,7 @@ fn LimitPanel(
                 }
                 div { class: "limit-meta",
                     span { "Unavailable" }
-                    span { "Refresh after sign-in" }
+                    span { "{unavailable_detail}" }
                 }
             }
         }
@@ -1106,10 +1165,28 @@ fn usage_since(history: &WindowHistory, start: i64, now: i64, end: i64) -> Optio
     })
 }
 
-fn daily_quota_lines(window: &LimitWindow, now: i64) -> Option<(f64, f64)> {
+fn daily_quota_lines(
+    window: &LimitWindow,
+    now: i64,
+    use_workweek_allocation: bool,
+) -> Option<(f64, f64)> {
     let duration = window.window_duration_mins? * 60;
     let reset = window.resets_at?;
     let window_start = reset - duration;
+    if use_workweek_allocation {
+        let today = Local.timestamp_opt(now, 0).single()?.date_naive();
+        if matches!(today.weekday(), Weekday::Sat | Weekday::Sun) {
+            return None;
+        }
+        let window_start_date = Local.timestamp_opt(window_start, 0).single()?.date_naive();
+        let elapsed_days = (today - window_start_date).num_days().max(0) as u64;
+        let completed_workdays = (0..elapsed_days)
+            .filter_map(|offset| window_start_date.checked_add_days(chrono::Days::new(offset)))
+            .filter(|date| !matches!(date.weekday(), Weekday::Sat | Weekday::Sun))
+            .count() as f64;
+        let start = (completed_workdays * 100.0 / 5.0).clamp(0.0, 100.0);
+        return Some((start, (start + 100.0 / 5.0).clamp(0.0, 100.0)));
+    }
     let (day_start, day_end) = local_day_bounds(now)?;
     let y = |at| ((at - window_start) as f64 * 100.0 / duration as f64).clamp(0.0, 100.0);
     Some((y(day_start), y(day_end)))
@@ -1422,7 +1499,7 @@ mod chart_tests {
 
     #[test]
     fn projects_burndown_from_elapsed_window_time() {
-        let mut account = Account::new("one".into(), "One".into());
+        let mut account = Account::new("one".into(), "One".into(), AccountProvider::Codex);
         let mut window = LimitWindow {
             used_percent: 10,
             window_duration_mins: Some(100),
@@ -1615,9 +1692,21 @@ mod chart_tests {
             window_duration_mins: Some(domain::WEEK_MINUTES),
             resets_at: Some(start + domain::WEEK_MINUTES * 60),
         };
-        let lines = daily_quota_lines(&window, start + 12 * 3_600).unwrap();
+        let lines = daily_quota_lines(&window, start + 12 * 3_600, false).unwrap();
         assert_eq!(lines.0, 0.0);
         assert!((lines.1 - 100.0 / 7.0).abs() < 0.001);
+        let workweek_lines = daily_quota_lines(&window, start + 12 * 3_600, true).unwrap();
+        assert_eq!(workweek_lines.0, 0.0);
+        assert_eq!(workweek_lines.1, 20.0);
+        let saturday = Local.with_ymd_and_hms(2026, 9, 12, 12, 0, 0).unwrap();
+        assert!(daily_quota_lines(&window, saturday.timestamp(), true).is_none());
+        let sunday = Local.with_ymd_and_hms(2026, 9, 13, 12, 0, 0).unwrap();
+        assert!(daily_quota_lines(&window, sunday.timestamp(), true).is_none());
+        let monday = Local.with_ymd_and_hms(2026, 9, 14, 12, 0, 0).unwrap();
+        assert_eq!(
+            daily_quota_lines(&window, monday.timestamp(), true),
+            Some((80.0, 100.0))
+        );
         assert_eq!(
             daily_pace(chart.used_percent, start + 12 * 3_600),
             Some(("DEFICIT", -1))
@@ -1724,7 +1813,7 @@ mod chart_tests {
     }
     #[test]
     fn disables_weekend_mode_without_weekly_workweek_lines() {
-        let mut account = Account::new("one".into(), "One".into());
+        let mut account = Account::new("one".into(), "One".into(), AccountProvider::Codex);
         account.usage_history.session.weekend_zero_usage = true;
         account.usage_history.weekly.weekend_zero_usage = true;
 
@@ -1768,38 +1857,84 @@ async fn login_account(mut state: Signal<AppState>, id: String) {
     else {
         return;
     };
-    if let Err(error) = store.prepare_account(&id) {
-        finish_operation(state, &id, account, None, Some(error));
+    let provider = account.provider;
+    if let Err(error) = store.prepare_account(&id, provider) {
+        finish_operation(state, &id, account, None, Some(error), None);
         return;
     }
-    match codex::login(&store.account_home(&id)).await {
+    let home = store.account_home(&id, provider);
+    let result = match provider {
+        AccountProvider::Codex => codex::login(&home).await,
+        AccountProvider::Claude => claude::login(&home).await,
+    };
+    match result {
         Ok(snapshot) => {
+            let quota_available =
+                snapshot.limits.session.is_some() || snapshot.limits.weekly.is_some();
             apply_snapshot(&mut account, &snapshot, Local::now().timestamp());
             account.connected = true;
             account.observe_active_windows(&snapshot.limits, Local::now().timestamp());
-            finish_operation(state, &id, account, Some(snapshot.limits), None);
+            let notice = match &account.provider {
+                AccountProvider::Codex => {
+                    "Codex account connected. Limits stay isolated from active Codex login."
+                }
+                AccountProvider::Claude if quota_available => {
+                    "Claude account connected. Config stays isolated from active Claude login. Claude OAuth quota refreshed."
+                }
+                AccountProvider::Claude => {
+                    "Claude account connected. Config stays isolated from active Claude login. Claude OAuth quota unavailable."
+                }
+            }
+            .to_string();
+            finish_operation(
+                state,
+                &id,
+                account,
+                Some(snapshot.limits),
+                None,
+                Some(false),
+            );
             state.write().notice = Some(Notice {
-                message:
-                    "Account connected. Limits will stay isolated from your active Codex login."
-                        .to_string(),
+                message: notice,
                 error: false,
             });
         }
-        Err(error) => finish_operation(state, &id, account, None, Some(error)),
+        Err(error) => finish_operation(state, &id, account, None, Some(error), None),
     }
 }
 
 async fn refresh_account(mut state: Signal<AppState>, id: String, automatic: bool) {
-    let Some((store, mut account)) = begin_operation(state, &id, "Refreshing limits") else {
+    let provider = state
+        .read()
+        .accounts
+        .iter()
+        .find(|view| view.account.id == id)
+        .map(|view| view.account.provider);
+    let Some(provider) = provider else {
         return;
     };
-    let initial = match codex::fetch_snapshot(&store.account_home(&id)).await {
+    let Some((store, mut account)) = begin_operation(state, &id, refresh_action(provider)) else {
+        return;
+    };
+    let home = store.account_home(&id, provider);
+    let initial = match provider {
+        AccountProvider::Codex => codex::fetch_snapshot(&home).await,
+        AccountProvider::Claude => claude::fetch_snapshot(&home).await,
+    };
+    let initial = match initial {
         Ok(snapshot) => snapshot,
         Err(error) => {
             if error.contains("not signed in") {
                 account.connected = false;
             }
-            finish_operation(state, &id, account, None, Some(error));
+            finish_operation(
+                state,
+                &id,
+                account,
+                None,
+                Some(error),
+                Some(matches!(provider, AccountProvider::Claude)),
+            );
             return;
         }
     };
@@ -1809,18 +1944,23 @@ async fn refresh_account(mut state: Signal<AppState>, id: String, automatic: boo
     account.observe_active_windows(&initial.limits, decision_time.timestamp());
 
     if !automatic {
-        finish_operation(state, &id, account, Some(initial.limits), None);
+        finish_operation(state, &id, account, Some(initial.limits), None, Some(false));
         return;
     }
 
     let plan = plan_warmup(decision_time, &account, &initial.limits);
     if plan.is_empty() {
-        finish_operation(state, &id, account, Some(initial.limits), None);
+        finish_operation(state, &id, account, Some(initial.limits), None, Some(false));
         return;
     }
 
     set_busy(&mut state, &id, format!("Starting {}", plan.reason()));
-    match codex::warm_and_fetch(&store.account_home(&id), &store.warmup_workspace(&id)).await {
+    let workspace = store.warmup_workspace(&id);
+    let outcome = match provider {
+        AccountProvider::Codex => codex::warm_and_fetch(&home, &workspace).await,
+        AccountProvider::Claude => claude::warm_and_fetch(&home, &workspace).await,
+    };
+    match outcome {
         Ok(outcome) => {
             let completed_at = Local::now().timestamp();
             account.record_success(&plan, completed_at);
@@ -1834,11 +1974,20 @@ async fn refresh_account(mut state: Signal<AppState>, id: String, automatic: boo
                     snapshot.limits.clone()
                 })
                 .unwrap_or(initial.limits);
-            finish_operation(state, &id, account, Some(limits), outcome.refresh_error);
+            let quota_refresh_failed =
+                matches!(provider, AccountProvider::Claude) && outcome.refresh_error.is_some();
+            finish_operation(
+                state,
+                &id,
+                account,
+                Some(limits),
+                outcome.refresh_error,
+                Some(quota_refresh_failed),
+            );
         }
         Err(error) => {
             account.record_failure(plan.reason(), Local::now().timestamp());
-            finish_operation(state, &id, account, Some(initial.limits), Some(error));
+            finish_operation(state, &id, account, Some(initial.limits), Some(error), None);
         }
     }
 }
@@ -1847,7 +1996,14 @@ async fn manual_warmup(mut state: Signal<AppState>, id: String) {
     let Some((store, mut account)) = begin_operation(state, &id, "Sending a minimal warmup") else {
         return;
     };
-    match codex::warm_and_fetch(&store.account_home(&id), &store.warmup_workspace(&id)).await {
+    let provider = account.provider;
+    let home = store.account_home(&id, provider);
+    let workspace = store.warmup_workspace(&id);
+    let outcome = match provider {
+        AccountProvider::Codex => codex::warm_and_fetch(&home, &workspace).await,
+        AccountProvider::Claude => claude::warm_and_fetch(&home, &workspace).await,
+    };
+    match outcome {
         Ok(outcome) => {
             let completed_at = Local::now().timestamp();
             account.record_manual_success(completed_at);
@@ -1857,35 +2013,68 @@ async fn manual_warmup(mut state: Signal<AppState>, id: String) {
                 account.confirm_warmed_windows(&snapshot.limits, completed_at);
                 snapshot.limits.clone()
             });
-            finish_operation(state, &id, account, limits, outcome.refresh_error);
+            let quota_available = outcome.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.limits.session.is_some() || snapshot.limits.weekly.is_some()
+            });
+            let quota_refresh_failed = outcome.refresh_error.is_some();
+            let notice = match &account.provider {
+                AccountProvider::Codex => "Warmup completed.",
+                AccountProvider::Claude if quota_refresh_failed => {
+                    "Claude warmup completed. Claude OAuth quota refresh failed."
+                }
+                AccountProvider::Claude if !quota_available => {
+                    "Claude warmup completed. Claude OAuth quota unavailable."
+                }
+                AccountProvider::Claude => "Claude warmup completed. Claude OAuth quota refreshed.",
+            };
+            let claude_quota_refresh_failed =
+                matches!(&account.provider, AccountProvider::Claude) && quota_refresh_failed;
+            finish_operation(
+                state,
+                &id,
+                account,
+                limits,
+                outcome.refresh_error,
+                Some(claude_quota_refresh_failed),
+            );
             state.write().notice = Some(Notice {
-                message: "Warmup completed.".to_string(),
-                error: false,
+                message: notice.to_string(),
+                error: claude_quota_refresh_failed,
             });
         }
         Err(error) => {
             account.record_failure(WarmReason::Manual, Local::now().timestamp());
-            finish_operation(state, &id, account, None, Some(error));
+            finish_operation(state, &id, account, None, Some(error), None);
         }
     }
 }
 
 async fn delete_account(mut state: Signal<AppState>, id: String) {
-    let Some((store, account)) = begin_operation(state, &id, "Removing account credentials") else {
+    let Some((store, account)) = begin_operation(state, &id, "Removing account storage") else {
         return;
     };
-    if let Err(error) = codex::logout(&store.account_home(&id)).await {
-        finish_operation(state, &id, account, None, Some(error));
+    let provider = account.provider;
+    let home = store.account_home(&id, provider);
+    let result = match provider {
+        AccountProvider::Codex => codex::logout(&home).await,
+        AccountProvider::Claude => claude::logout(&home).await,
+    };
+    if let Err(error) = result {
+        finish_operation(state, &id, account, None, Some(error), None);
         return;
     }
     if let Err(error) = store.remove_account(&id) {
-        finish_operation(state, &id, account, None, Some(error));
+        finish_operation(state, &id, account, None, Some(error), None);
         return;
     }
+    let notice = match &account.provider {
+        AccountProvider::Codex => "Codex account and its isolated credentials were removed.",
+        AccountProvider::Claude => "Claude account and its isolated config were removed.",
+    };
     state.write().accounts.retain(|view| view.account.id != id);
     persist(state);
     state.write().notice = Some(Notice {
-        message: "Account and its isolated credentials were removed.".to_string(),
+        message: notice.to_string(),
         error: false,
     });
 }
@@ -1906,6 +2095,7 @@ fn begin_operation(
     }
     view.busy = Some(action.to_string());
     view.error = None;
+    view.quota_refresh_failed = false;
     Some((store, view.account.clone()))
 }
 
@@ -1926,6 +2116,7 @@ fn finish_operation(
     account: Account,
     limits: Option<UsageWindows>,
     error: Option<String>,
+    quota_refresh_failed: Option<bool>,
 ) {
     if let Some(view) = state
         .write()
@@ -1936,6 +2127,9 @@ fn finish_operation(
         view.account = account;
         if limits.is_some() {
             view.limits = limits;
+        }
+        if let Some(quota_refresh_failed) = quota_refresh_failed {
+            view.quota_refresh_failed = quota_refresh_failed;
         }
         view.busy = None;
         view.error = error;
@@ -2077,6 +2271,20 @@ fn remove_time(mut state: Signal<AppState>, id: &str, time: DailyTime) {
     persist(state);
 }
 
+fn provider_name(provider: &AccountProvider) -> &'static str {
+    match provider {
+        AccountProvider::Codex => "Codex",
+        AccountProvider::Claude => "Claude",
+    }
+}
+
+fn refresh_action(provider: AccountProvider) -> &'static str {
+    match provider {
+        AccountProvider::Codex => "Refreshing limits",
+        AccountProvider::Claude => "Refreshing Claude OAuth quota",
+    }
+}
+
 fn initials(label: &str) -> String {
     label
         .split_whitespace()
@@ -2144,10 +2352,30 @@ fn account_status(view: &AccountView, now: &chrono::DateTime<Local>) -> String {
         return action.clone();
     }
     if !view.account.connected {
-        return "Sign in required".to_string();
+        return if matches!(&view.account.provider, AccountProvider::Claude) {
+            "Claude sign-in required".to_string()
+        } else {
+            "Sign in required".to_string()
+        };
     }
     if !view.account.enabled {
-        return "Automatic warmups paused".to_string();
+        return if matches!(&view.account.provider, AccountProvider::Claude) {
+            "Claude automatic warmups paused".to_string()
+        } else {
+            "Automatic warmups paused".to_string()
+        };
+    }
+    if matches!(&view.account.provider, AccountProvider::Claude) {
+        if view.quota_refresh_failed {
+            return "Claude OAuth quota refresh failed".to_string();
+        }
+        if view
+            .limits
+            .as_ref()
+            .is_none_or(|limits| limits.session.is_none() && limits.weekly.is_none())
+        {
+            return "Claude OAuth quota unavailable".to_string();
+        }
     }
     next_slot(now, &view.account.warmup_times)
         .map(|slot| format!("Next scheduled {}", format_slot(slot.at)))
@@ -2155,6 +2383,9 @@ fn account_status(view: &AccountView, now: &chrono::DateTime<Local>) -> String {
 }
 
 fn weekly_reset_needs_probe(view: &AccountView, now: i64) -> bool {
+    if matches!(&view.account.provider, AccountProvider::Claude) && view.quota_refresh_failed {
+        return false;
+    }
     let Some(window) = view
         .limits
         .as_ref()

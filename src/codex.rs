@@ -8,25 +8,12 @@ use tokio::{
     time::timeout,
 };
 
-use crate::domain::{RateLimitResponse, UsageWindows};
+use crate::domain::{AccountSnapshot, RateLimitResponse, UsageWindows, WarmupOutcome};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const WARMUP_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 static CODEX_PROCESS: Semaphore = Semaphore::const_new(1);
-
-#[derive(Clone, Debug, Default)]
-pub struct AccountSnapshot {
-    pub email: Option<String>,
-    pub plan: Option<String>,
-    pub limits: UsageWindows,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct WarmupOutcome {
-    pub snapshot: Option<AccountSnapshot>,
-    pub refresh_error: Option<String>,
-}
 
 struct AppServer {
     _permit: SemaphorePermit<'static>,

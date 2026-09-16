@@ -7,7 +7,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::domain::{Account, AppConfig, DEFAULT_REFRESH_INTERVAL_SECS};
+use crate::domain::{Account, AccountProvider, AppConfig, DEFAULT_REFRESH_INTERVAL_SECS};
 
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -132,15 +132,19 @@ impl Store {
         Ok(())
     }
 
-    pub fn account_home(&self, id: &str) -> PathBuf {
-        self.root.join("accounts").join(id).join("codex-home")
+    pub fn account_home(&self, id: &str, provider: AccountProvider) -> PathBuf {
+        let home = match provider {
+            AccountProvider::Codex => "codex-home",
+            AccountProvider::Claude => "claude-home",
+        };
+        self.root.join("accounts").join(id).join(home)
     }
 
     pub fn warmup_workspace(&self, id: &str) -> PathBuf {
         self.root.join("accounts").join(id).join("warmup")
     }
 
-    pub fn prepare_account(&self, id: &str) -> Result<(), String> {
+    pub fn prepare_account(&self, id: &str, provider: AccountProvider) -> Result<(), String> {
         validate_account_id(id)?;
         let account = self.root.join("accounts").join(id);
         if !account.exists() {
@@ -148,7 +152,7 @@ impl Store {
                 .map_err(|error| format!("Could not create account storage: {error}"))?;
         }
         verify_directory(&account)?;
-        let home = self.account_home(id);
+        let home = self.account_home(id, provider);
         let workspace = self.warmup_workspace(id);
         for path in [&home, &workspace] {
             if !path.exists() {
@@ -157,10 +161,12 @@ impl Store {
             }
             verify_directory(path)?;
         }
-        let config = home.join("config.toml");
-        if !config.exists() {
-            fs::write(config, "cli_auth_credentials_store = \"keyring\"\n")
-                .map_err(|error| format!("Could not configure account storage: {error}"))?;
+        if matches!(provider, AccountProvider::Codex) {
+            let config = home.join("config.toml");
+            if !config.exists() {
+                fs::write(config, "cli_auth_credentials_store = \"keyring\"\n")
+                    .map_err(|error| format!("Could not configure account storage: {error}"))?;
+            }
         }
         Ok(())
     }
@@ -211,11 +217,9 @@ fn verify_directory(path: &Path) -> Result<(), String> {
     let resolved = path
         .canonicalize()
         .map_err(|error| format!("Could not verify app storage: {error}"))?;
-    let is_symlink = fs::symlink_metadata(path)
-        .map_err(|error| format!("Could not verify app storage: {error}"))?
-        .file_type()
-        .is_symlink();
-    if resolved != path || is_symlink {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("Could not verify app storage: {error}"))?;
+    if resolved != path || metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err("Refusing to use aliased app storage".to_string());
     }
     Ok(())
@@ -233,7 +237,7 @@ pub fn new_account_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::{LimitWindow, UsageWindows};
+    use crate::domain::{AccountProvider, LimitWindow, UsageWindows};
 
     use super::*;
 
@@ -241,7 +245,7 @@ mod tests {
     fn round_trips_metadata_without_touching_auth_cache() {
         let root = env::temp_dir().join(format!("codex-keep-warm-test-{}", new_account_id()));
         let store = Store::new(root.clone()).unwrap();
-        let mut account = Account::new("abc001".into(), "Personal".into());
+        let mut account = Account::new("abc001".into(), "Personal".into(), AccountProvider::Codex);
         account.record_usage(
             &UsageWindows {
                 session: Some(LimitWindow {
@@ -257,7 +261,9 @@ mod tests {
         account.usage_history.session.show_workweek_lines = true;
         account.usage_history.weekly.show_workweek_lines = true;
         account.usage_history.weekly.weekend_zero_usage = true;
-        store.prepare_account(&account.id).unwrap();
+        store
+            .prepare_account(&account.id, AccountProvider::Codex)
+            .unwrap();
         store
             .save_accounts(std::slice::from_ref(&account), 45)
             .unwrap();
@@ -289,13 +295,73 @@ mod tests {
             1
         );
         assert_eq!(store.load().unwrap().refresh_interval_secs, 45);
-        assert!(store.account_home(&account.id).join("config.toml").exists());
-        assert!(!store.account_home(&account.id).join("auth.json").exists());
+        assert!(
+            store
+                .account_home(&account.id, AccountProvider::Codex)
+                .join("config.toml")
+                .exists()
+        );
+        assert!(
+            !store
+                .account_home(&account.id, AccountProvider::Codex)
+                .join("auth.json")
+                .exists()
+        );
+        let claude_id = "def002";
+        store
+            .prepare_account(claude_id, AccountProvider::Claude)
+            .unwrap();
+        assert!(
+            store
+                .account_home(claude_id, AccountProvider::Claude)
+                .exists()
+        );
+        assert!(
+            !store
+                .account_home(claude_id, AccountProvider::Codex)
+                .exists()
+        );
+        assert!(
+            !store
+                .account_home(claude_id, AccountProvider::Claude)
+                .join("config.toml")
+                .exists()
+        );
+        assert!(
+            !store
+                .account_home(claude_id, AccountProvider::Claude)
+                .join(".credentials.json")
+                .exists()
+        );
         assert!(validate_account_id("../../target").is_err());
         assert!(Store::new(root.clone()).is_err());
         let settings = store.settings_path();
         fs::rename(&settings, settings.with_extension("json.bak")).unwrap();
         assert_eq!(store.load().unwrap().accounts[0].label, "Personal");
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+    use crate::domain::AccountProvider;
+
+    #[test]
+    fn refuses_provider_home_file() {
+        let root = env::temp_dir().join(format!("codex-keep-warm-test-{}", new_account_id()));
+        let store = Store::new(root.clone()).unwrap();
+        let account = root.join("accounts").join("abc003");
+        fs::create_dir(&account).unwrap();
+        fs::write(account.join("claude-home"), "not a directory").unwrap();
+
+        assert!(
+            store
+                .prepare_account("abc003", AccountProvider::Claude)
+                .is_err()
+        );
+
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }
