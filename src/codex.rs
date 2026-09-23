@@ -259,7 +259,7 @@ pub async fn warm_and_fetch(codex_home: &Path, workspace: &Path) -> Result<Warmu
         .request(
             "thread/start",
             Some(json!({
-                "model": "gpt-5.6-luna",
+                "model": "gpt-6-luna",
                 "cwd": canonical_workspace,
                 "ephemeral": true,
                 "approvalPolicy": "never",
