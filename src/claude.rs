@@ -1,16 +1,18 @@
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::{ExitStatus, Output, Stdio},
     time::Duration,
 };
 
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use reqwest::{
     StatusCode,
     header::{ACCEPT, AUTHORIZATION, HeaderValue},
 };
 use serde::Deserialize;
+use serde_json::Value;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::{Child, Command},
@@ -23,7 +25,7 @@ use crate::domain::{
 };
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(30);
-const OAUTH_USAGE_TIMEOUT: Duration = Duration::from_secs(30);
+const OAUTH_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const LOGOUT_TIMEOUT: Duration = Duration::from_secs(30);
 const WARMUP_TIMEOUT: Duration = Duration::from_secs(2 * 60);
@@ -31,6 +33,13 @@ const WARMUP_PROMPT: &str = "Reply exactly OK.";
 const OAUTH_USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 const OAUTH_BETA_VERSION: &str = "oauth-2025-04-20";
 const REQUIRED_OAUTH_SCOPE: &str = "user:profile";
+// Claude Code's token endpoint and public client ID, as used by the Claude CLI and CodexBar.
+const OAUTH_TOKEN_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token";
+const OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+// Claude Code refreshes access tokens five minutes before expiry.
+const OAUTH_REFRESH_MARGIN_MS: f64 = 5.0 * 60.0 * 1000.0;
+const CREDENTIALS_FILE: &str = ".credentials.json";
+const CREDENTIALS_TEMP_FILE: &str = ".credentials.json.tmp";
 const OAUTH_OVERRIDING_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
@@ -96,8 +105,25 @@ struct ClaudeCredentialsFile {
 #[serde(rename_all = "camelCase")]
 struct ClaudeAiOauth {
     access_token: String,
+    refresh_token: Option<String>,
+    expires_at: Option<f64>,
+    client_id: Option<String>,
     scopes: Option<Vec<String>>,
     subscription_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OAuthTokenResponse {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_in: i64,
+    refresh_token_expires_in: Option<i64>,
+    scope: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OAuthErrorResponse {
+    error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,13 +185,164 @@ pub async fn fetch_snapshot(home: &Path) -> Result<AccountSnapshot, String> {
     }
     validate_auth_status(&status)?;
 
-    let credentials = read_credentials(&canonical_home)?;
+    let credentials = current_credentials(&canonical_home).await?;
     let limits = fetch_oauth_usage(&credentials.access_token).await?;
     snapshot_from_status_and_limits(status, limits, credentials.subscription_type)
 }
 
-fn read_credentials(home: &Path) -> Result<ClaudeAiOauth, String> {
-    let path = home.join(".credentials.json");
+/// Reads the account's Claude Code credentials, refreshing an expiring access token the same way
+/// Claude Code does and writing the rotated tokens back into Claude Code's own credentials file.
+/// Keeping the file current matters: refresh tokens are single-use, so a rotated token kept only in
+/// memory would sign the Claude CLI out (CodexBar issue #1161).
+async fn current_credentials(home: &Path) -> Result<ClaudeAiOauth, String> {
+    // ponytail: excludes only this app's Claude processes, not a user-run `claude` sharing this
+    // CLAUDE_CONFIG_DIR; honor Claude's `.oauth_refresh.lock` if such sharing becomes supported.
+    let _permit = CLAUDE_PROCESS
+        .acquire()
+        .await
+        .map_err(|_| "Claude process queue closed".to_string())?;
+    let bytes = read_credentials(home)?;
+    let credentials = parse_credentials(&bytes)?;
+    let now_ms = Utc::now().timestamp_millis();
+    if !needs_refresh(&credentials, now_ms) {
+        return Ok(credentials);
+    }
+    let refresh_token = credentials
+        .refresh_token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| {
+            "Claude OAuth access token expired and no refresh token is stored; sign in again"
+                .to_string()
+        })?;
+    let tokens = refresh_oauth_tokens(
+        refresh_token,
+        credentials.client_id.as_deref().unwrap_or(OAUTH_CLIENT_ID),
+        credentials.scopes.as_deref(),
+    )
+    .await?;
+
+    let mut file: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| "Claude OAuth credentials are invalid".to_string())?;
+    apply_refreshed_tokens(&mut file, tokens, Utc::now().timestamp_millis())?;
+    let updated = serde_json::to_vec(&file)
+        .map_err(|_| "Could not serialize refreshed Claude OAuth credentials".to_string())?;
+    write_credentials(home, &updated)?;
+    parse_credentials(&updated)
+}
+
+fn needs_refresh(credentials: &ClaudeAiOauth, now_ms: i64) -> bool {
+    // Like Claude Code, a missing expiry means the token is treated as current.
+    credentials
+        .expires_at
+        .is_some_and(|expires_at| now_ms as f64 + OAUTH_REFRESH_MARGIN_MS >= expires_at)
+}
+
+async fn refresh_oauth_tokens(
+    refresh_token: &str,
+    client_id: &str,
+    scopes: Option<&[String]>,
+) -> Result<OAuthTokenResponse, String> {
+    let mut body = serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+    });
+    if let Some(scopes) = scopes.filter(|scopes| !scopes.is_empty()) {
+        body["scope"] = scopes.join(" ").into();
+    }
+    let response = oauth_client()?
+        .post(OAUTH_TOKEN_ENDPOINT)
+        .header(ACCEPT, "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| oauth_request_error(error, "Claude OAuth token refresh"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let code = status.as_u16();
+        let error = response
+            .json::<OAuthErrorResponse>()
+            .await
+            .ok()
+            .and_then(|body| body.error);
+        return Err(
+            if matches!(code, 400 | 401) && error.as_deref() == Some("invalid_grant") {
+                "Claude OAuth session expired or was revoked; sign in again".to_string()
+            } else {
+                format!("Claude OAuth token refresh failed with HTTP status {code}")
+            },
+        );
+    }
+    let tokens = response
+        .json::<OAuthTokenResponse>()
+        .await
+        .map_err(|error| oauth_request_error(error, "Claude OAuth token refresh"))?;
+    if tokens.access_token.trim().is_empty() {
+        return Err("Claude OAuth token refresh returned no access token".to_string());
+    }
+    Ok(tokens)
+}
+
+/// Updates only the token fields Claude Code rotates, preserving everything else in the file.
+fn apply_refreshed_tokens(
+    file: &mut Value,
+    tokens: OAuthTokenResponse,
+    now_ms: i64,
+) -> Result<(), String> {
+    let oauth = file
+        .get_mut("claudeAiOauth")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| "Claude OAuth credentials do not contain claudeAiOauth".to_string())?;
+    oauth.insert("accessToken".into(), tokens.access_token.into());
+    if let Some(refresh_token) = tokens.refresh_token {
+        oauth.insert("refreshToken".into(), refresh_token.into());
+    }
+    oauth.insert(
+        "expiresAt".into(),
+        (now_ms + tokens.expires_in * 1000).into(),
+    );
+    if let Some(seconds) = tokens.refresh_token_expires_in {
+        oauth.insert(
+            "refreshTokenExpiresAt".into(),
+            (now_ms + seconds * 1000).into(),
+        );
+    }
+    if let Some(scope) = tokens.scope {
+        oauth.insert(
+            "scopes".into(),
+            scope.split_whitespace().collect::<Vec<_>>().into(),
+        );
+    }
+    Ok(())
+}
+
+fn write_credentials(home: &Path, bytes: &[u8]) -> Result<(), String> {
+    let temp = home.join(CREDENTIALS_TEMP_FILE);
+    let result = (|| {
+        match fs::remove_file(&temp) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+        let mut options = fs::OpenOptions::new();
+        // create_new refuses to follow a planted link at the temp path.
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp, home.join(CREDENTIALS_FILE))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result.map_err(|error| format!("Could not save refreshed Claude OAuth credentials: {error}"))
+}
+
+fn read_credentials(home: &Path) -> Result<Vec<u8>, String> {
+    let path = home.join(CREDENTIALS_FILE);
     let metadata = fs::symlink_metadata(&path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             "Claude OAuth credentials file is missing; sign in with Claude first".to_string()
@@ -191,14 +368,13 @@ fn read_credentials(home: &Path) -> Result<ClaudeAiOauth, String> {
         return Err("Refusing to use aliased Claude OAuth credentials".to_string());
     }
 
-    let bytes = fs::read(&canonical_path).map_err(|error| {
+    fs::read(&canonical_path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             "Claude OAuth credentials file is missing; sign in with Claude first".to_string()
         } else {
             format!("Could not read Claude OAuth credentials: {error}")
         }
-    })?;
-    parse_credentials(&bytes)
+    })
 }
 
 fn parse_credentials(bytes: &[u8]) -> Result<ClaudeAiOauth, String> {
@@ -220,46 +396,44 @@ fn parse_credentials(bytes: &[u8]) -> Result<ClaudeAiOauth, String> {
     Ok(oauth)
 }
 
+fn oauth_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(OAUTH_TIMEOUT)
+        .build()
+        .map_err(|_| "Could not prepare Claude OAuth request".to_string())
+}
+
+fn oauth_request_error(error: reqwest::Error, operation: &str) -> String {
+    if error.is_timeout() {
+        format!(
+            "{operation} timed out after {} seconds",
+            OAUTH_TIMEOUT.as_secs()
+        )
+    } else if error.is_decode() {
+        format!("{operation} response was invalid; endpoint may have changed")
+    } else {
+        format!("{operation} failed: {error}")
+    }
+}
+
 async fn fetch_oauth_usage(access_token: &str) -> Result<UsageWindows, String> {
     let authorization = HeaderValue::from_str(&format!("Bearer {access_token}"))
         .map_err(|_| "Claude OAuth access token is invalid".to_string())?;
-    let client = reqwest::Client::builder()
-        .timeout(OAUTH_USAGE_TIMEOUT)
-        .build()
-        .map_err(|_| "Could not prepare Claude OAuth usage request".to_string())?;
-    let response = client
+    let response = oauth_client()?
         .get(OAUTH_USAGE_ENDPOINT)
         .header(AUTHORIZATION, authorization)
         .header("anthropic-beta", OAUTH_BETA_VERSION)
         .header(ACCEPT, "application/json")
         .send()
         .await
-        .map_err(|error| {
-            if error.is_timeout() {
-                format!(
-                    "Claude OAuth usage request timed out after {} seconds",
-                    OAUTH_USAGE_TIMEOUT.as_secs()
-                )
-            } else {
-                format!("Could not fetch Claude OAuth usage: {error}")
-            }
-        })?;
+        .map_err(|error| oauth_request_error(error, "Claude OAuth usage"))?;
     if !response.status().is_success() {
         return Err(oauth_usage_status_error(response.status()));
     }
     let usage = response
         .json::<OAuthUsageResponse>()
         .await
-        .map_err(|error| {
-            if error.is_timeout() {
-                format!(
-                    "Claude OAuth usage request timed out after {} seconds",
-                    OAUTH_USAGE_TIMEOUT.as_secs()
-                )
-            } else {
-                "Claude OAuth usage response was invalid; endpoint may have changed".to_string()
-            }
-        })?;
+        .map_err(|error| oauth_request_error(error, "Claude OAuth usage"))?;
     usage_windows_from_response(usage)
 }
 
@@ -756,5 +930,72 @@ mod tests {
             .expect("null usage"),
             UsageWindows::default()
         );
+    }
+
+    #[test]
+    fn refreshes_only_within_claude_expiry_margin() {
+        let expires_at = 10_000_000.0;
+        let expiring = |expires_at| {
+            credentials(serde_json::json!({
+                "claudeAiOauth": { "accessToken": "oauth-token", "expiresAt": expires_at }
+            }))
+            .expect("credentials")
+        };
+        let now = |offset: f64| (expires_at - OAUTH_REFRESH_MARGIN_MS + offset) as i64;
+
+        assert!(!needs_refresh(&expiring(expires_at), now(-1.0)));
+        assert!(needs_refresh(&expiring(expires_at), now(0.0)));
+        assert!(needs_refresh(&expiring(0.0), now(0.0)));
+        let no_expiry = credentials(serde_json::json!({
+            "claudeAiOauth": { "accessToken": "oauth-token" }
+        }))
+        .expect("credentials");
+        assert!(!needs_refresh(&no_expiry, i64::MAX));
+    }
+
+    #[test]
+    fn refreshed_tokens_rotate_in_place_and_preserve_claude_fields() {
+        let mut file = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "old-access",
+                "refreshToken": "old-refresh",
+                "expiresAt": 1,
+                "scopes": ["user:profile", "user:inference"],
+                "subscriptionType": "max",
+                "rateLimitTier": "default_claude_max_5x",
+            },
+            "mcpOAuth": { "server": { "accessToken": "mcp" } },
+        });
+        let tokens: OAuthTokenResponse = serde_json::from_value(serde_json::json!({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 28_800,
+            "refresh_token_expires_in": 60,
+            "token_type": "Bearer",
+        }))
+        .expect("token response");
+
+        apply_refreshed_tokens(&mut file, tokens, 1_000).expect("refreshed tokens");
+
+        let oauth = &file["claudeAiOauth"];
+        assert_eq!(oauth["accessToken"], "new-access");
+        assert_eq!(oauth["refreshToken"], "new-refresh");
+        assert_eq!(oauth["expiresAt"], 1_000 + 28_800_000);
+        assert_eq!(oauth["refreshTokenExpiresAt"], 61_000);
+        assert_eq!(
+            oauth["scopes"],
+            serde_json::json!(["user:profile", "user:inference"])
+        );
+        assert_eq!(oauth["subscriptionType"], "max");
+        assert_eq!(oauth["rateLimitTier"], "default_claude_max_5x");
+        assert_eq!(file["mcpOAuth"]["server"]["accessToken"], "mcp");
+
+        let tokens: OAuthTokenResponse = serde_json::from_value(serde_json::json!({
+            "access_token": "newer-access",
+            "expires_in": 60,
+        }))
+        .expect("token response without rotation");
+        apply_refreshed_tokens(&mut file, tokens, 0).expect("refreshed tokens");
+        assert_eq!(file["claudeAiOauth"]["refreshToken"], "new-refresh");
     }
 }
