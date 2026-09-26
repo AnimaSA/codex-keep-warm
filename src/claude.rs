@@ -1,15 +1,17 @@
 use std::{
+    collections::BTreeMap,
     fs,
     io::Write,
     path::{Path, PathBuf},
     process::{ExitStatus, Output, Stdio},
-    time::Duration,
+    sync::Mutex,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Utc};
 use reqwest::{
     StatusCode,
-    header::{ACCEPT, AUTHORIZATION, HeaderValue},
+    header::{ACCEPT, AUTHORIZATION, HeaderValue, RETRY_AFTER},
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -33,6 +35,10 @@ const WARMUP_PROMPT: &str = "Reply exactly OK.";
 const OAUTH_USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 const OAUTH_BETA_VERSION: &str = "oauth-2025-04-20";
 const REQUIRED_OAUTH_SCOPE: &str = "user:profile";
+// The usage endpoint rate-limits per account without a published budget; without Retry-After,
+// back off 5 minutes, doubling per consecutive 429 up to an hour.
+const USAGE_BACKOFF_BASE: Duration = Duration::from_secs(5 * 60);
+const USAGE_BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
 // Claude Code's token endpoint and public client ID, as used by the Claude CLI and CodexBar.
 const OAUTH_TOKEN_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token";
 const OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -78,6 +84,13 @@ const OAUTH_OVERRIDING_ENV: &[&str] = &[
     "CLAUDE_CODE_USE_MANTLE",
     "CLAUDE_CODE_USE_VERTEX",
 ];
+
+struct UsageBackoff {
+    until: Instant,
+    strikes: u32,
+}
+
+static USAGE_BACKOFF: Mutex<BTreeMap<PathBuf, UsageBackoff>> = Mutex::new(BTreeMap::new());
 
 const FIRST_PARTY_AUTH_METHODS: &[&str] = &["claude.ai", "oauth_token"];
 const FIRST_PARTY_API_PROVIDER: &str = "firstParty";
@@ -185,8 +198,9 @@ pub async fn fetch_snapshot(home: &Path) -> Result<AccountSnapshot, String> {
     }
     validate_auth_status(&status)?;
 
+    check_usage_backoff(&canonical_home)?;
     let credentials = current_credentials(&canonical_home).await?;
-    let limits = fetch_oauth_usage(&credentials.access_token).await?;
+    let limits = fetch_oauth_usage(&canonical_home, &credentials.access_token).await?;
     snapshot_from_status_and_limits(status, limits, credentials.subscription_type)
 }
 
@@ -416,7 +430,7 @@ fn oauth_request_error(error: reqwest::Error, operation: &str) -> String {
     }
 }
 
-async fn fetch_oauth_usage(access_token: &str) -> Result<UsageWindows, String> {
+async fn fetch_oauth_usage(home: &Path, access_token: &str) -> Result<UsageWindows, String> {
     let authorization = HeaderValue::from_str(&format!("Bearer {access_token}"))
         .map_err(|_| "Claude OAuth access token is invalid".to_string())?;
     let response = oauth_client()?
@@ -427,9 +441,19 @@ async fn fetch_oauth_usage(access_token: &str) -> Result<UsageWindows, String> {
         .send()
         .await
         .map_err(|error| oauth_request_error(error, "Claude OAuth usage"))?;
+    if response.status() == StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        let wait = record_usage_rate_limit(home, retry_after);
+        return Err(usage_rate_limited_error(wait));
+    }
     if !response.status().is_success() {
         return Err(oauth_usage_status_error(response.status()));
     }
+    usage_backoff().remove(home);
     let usage = response
         .json::<OAuthUsageResponse>()
         .await
@@ -456,6 +480,50 @@ fn oauth_usage_status_error(status: StatusCode) -> String {
         }
         _ => format!("Claude OAuth usage request failed with HTTP status {code}"),
     }
+}
+
+fn usage_backoff() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, UsageBackoff>> {
+    USAGE_BACKOFF
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Skips the usage request while a previous 429 backoff for this account is still active.
+fn check_usage_backoff(home: &Path) -> Result<(), String> {
+    let now = Instant::now();
+    match usage_backoff().get(home) {
+        Some(backoff) if backoff.until > now => {
+            Err(usage_rate_limited_error(backoff.until - now))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn record_usage_rate_limit(home: &Path, retry_after: Option<u64>) -> Duration {
+    let mut backoffs = usage_backoff();
+    let strikes = backoffs.get(home).map_or(0, |backoff| backoff.strikes);
+    let wait = usage_backoff_delay(retry_after, strikes);
+    backoffs.insert(
+        home.to_path_buf(),
+        UsageBackoff {
+            until: Instant::now() + wait,
+            strikes: strikes.saturating_add(1),
+        },
+    );
+    wait
+}
+
+fn usage_backoff_delay(retry_after: Option<u64>, strikes: u32) -> Duration {
+    retry_after.map(Duration::from_secs).unwrap_or_else(|| {
+        USAGE_BACKOFF_BASE
+            .saturating_mul(1 << strikes.min(4))
+            .min(USAGE_BACKOFF_MAX)
+    })
+}
+
+fn usage_rate_limited_error(wait: Duration) -> String {
+    let minutes = wait.as_secs().div_ceil(60).max(1);
+    format!("Claude OAuth usage rate limited (HTTP 429); retrying in {minutes} min")
 }
 
 #[cfg(test)]
@@ -780,6 +848,23 @@ mod tests {
     fn credentials(payload: serde_json::Value) -> Result<ClaudeAiOauth, String> {
         let payload = payload.to_string();
         parse_credentials(payload.as_bytes())
+    }
+
+    #[test]
+    fn usage_rate_limit_honors_retry_after_and_backs_off_between_requests() {
+        assert_eq!(usage_backoff_delay(Some(42), 3), Duration::from_secs(42));
+        assert_eq!(usage_backoff_delay(None, 0), Duration::from_secs(5 * 60));
+        assert_eq!(usage_backoff_delay(None, 1), Duration::from_secs(10 * 60));
+        assert_eq!(usage_backoff_delay(None, 9), Duration::from_secs(60 * 60));
+
+        let home = Path::new("usage-backoff-test-home");
+        assert!(check_usage_backoff(home).is_ok());
+        record_usage_rate_limit(home, Some(120));
+        assert_eq!(
+            check_usage_backoff(home).unwrap_err(),
+            "Claude OAuth usage rate limited (HTTP 429); retrying in 2 min"
+        );
+        usage_backoff().remove(home);
     }
 
     #[test]
