@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 
 pub const SESSION_MINUTES: i64 = 300;
 pub const WEEK_MINUTES: i64 = 10_080;
-pub const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 60;
 const RESET_FRESH_TOLERANCE_SECS: i64 = 300;
 const AUTO_GUARD_SECS: i64 = 120;
 const SCHEDULE_GRACE_SECS: i64 = 180;
@@ -50,7 +49,10 @@ impl FromStr for DailyTime {
 #[serde(default)]
 pub struct AppConfig {
     pub version: u8,
-    pub refresh_interval_secs: u64,
+    /// Settings from before per-provider intervals stored one shared value, tuned for Codex.
+    #[serde(alias = "refresh_interval_secs")]
+    pub codex_refresh_interval_secs: u64,
+    pub claude_refresh_interval_secs: u64,
     pub accounts: Vec<Account>,
 }
 
@@ -58,7 +60,8 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             version: 1,
-            refresh_interval_secs: DEFAULT_REFRESH_INTERVAL_SECS,
+            codex_refresh_interval_secs: AccountProvider::Codex.default_refresh_secs(),
+            claude_refresh_interval_secs: AccountProvider::Claude.default_refresh_secs(),
             accounts: Vec::new(),
         }
     }
@@ -70,6 +73,29 @@ pub enum AccountProvider {
     #[default]
     Codex,
     Claude,
+}
+
+impl AccountProvider {
+    pub const fn default_refresh_secs(self) -> u64 {
+        match self {
+            Self::Codex => 60,
+            Self::Claude => 300,
+        }
+    }
+
+    /// Inclusive automatic refresh bounds in seconds. Claude's usage endpoint rate-limits
+    /// aggressively, so Claude never polls faster than once a minute.
+    pub const fn refresh_secs_bounds(self) -> (u64, u64) {
+        match self {
+            Self::Codex => (5, 60),
+            Self::Claude => (60, 3600),
+        }
+    }
+
+    pub fn clamp_refresh_secs(self, secs: u64) -> u64 {
+        let (min, max) = self.refresh_secs_bounds();
+        secs.clamp(min, max)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

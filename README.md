@@ -44,7 +44,7 @@ cargo run --release
 
 The current Codex protocol integration is tested with `codex-cli 0.151.0`. Codex app-server schemas are versioned, so update the app if a future CLI reports an unsupported request. Claude sign-in, identity, and warmups use documented CLI commands; Claude quota refresh uses the undocumented OAuth endpoint described above.
 
-Add an account, choose Codex or Claude, complete browser sign-in, and edit its warmup times. The app refreshes account status and available Codex and Claude quota windows every 60 seconds by default; change interval beside account list heading. Claude quota windows require a supported first-party OAuth credential with `user:profile`.
+Add an account, choose Codex or Claude, complete browser sign-in, and edit its warmup times. The app refreshes account status and quota windows automatically: Codex every 60 seconds (range 5–60) and Claude every 5 minutes (range 60–3600 seconds) by default, since Claude's usage endpoint rate-limits aggressively. Change both intervals, and Windows startup, under Settings. Existing settings keep their old shared interval as the Codex interval. Claude quota windows require a supported first-party OAuth credential with `user:profile`.
 
 App metadata is stored under:
 

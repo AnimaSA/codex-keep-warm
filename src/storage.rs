@@ -7,7 +7,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::domain::{Account, AccountProvider, AppConfig, DEFAULT_REFRESH_INTERVAL_SECS};
+use crate::domain::{AccountProvider, AppConfig};
 
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -75,9 +75,10 @@ impl Store {
         let bytes = fs::read(path).map_err(|error| format!("Could not read settings: {error}"))?;
         let mut config: AppConfig = serde_json::from_slice(&bytes)
             .map_err(|error| format!("Settings are invalid: {error}"))?;
-        config.refresh_interval_secs = config
-            .refresh_interval_secs
-            .clamp(5, DEFAULT_REFRESH_INTERVAL_SECS);
+        config.codex_refresh_interval_secs = AccountProvider::Codex
+            .clamp_refresh_secs(config.codex_refresh_interval_secs);
+        config.claude_refresh_interval_secs = AccountProvider::Claude
+            .clamp_refresh_secs(config.claude_refresh_interval_secs);
         let mut ids = HashSet::new();
         for account in &mut config.accounts {
             validate_account_id(&account.id)?;
@@ -90,17 +91,8 @@ impl Store {
         Ok(config)
     }
 
-    pub fn save_accounts(
-        &self,
-        accounts: &[Account],
-        refresh_interval_secs: u64,
-    ) -> Result<(), String> {
-        let config = AppConfig {
-            version: 1,
-            refresh_interval_secs,
-            accounts: accounts.to_vec(),
-        };
-        let bytes = serde_json::to_vec_pretty(&config)
+    pub fn save(&self, config: &AppConfig) -> Result<(), String> {
+        let bytes = serde_json::to_vec_pretty(config)
             .map_err(|error| format!("Could not serialize settings: {error}"))?;
         let settings = self.settings_path();
         let temporary = settings.with_extension("json.tmp");
@@ -237,7 +229,7 @@ pub fn new_account_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::{AccountProvider, LimitWindow, UsageWindows};
+    use crate::domain::{Account, AccountProvider, LimitWindow, UsageWindows};
 
     use super::*;
 
@@ -265,7 +257,12 @@ mod tests {
             .prepare_account(&account.id, AccountProvider::Codex)
             .unwrap();
         store
-            .save_accounts(std::slice::from_ref(&account), 45)
+            .save(&AppConfig {
+                codex_refresh_interval_secs: 45,
+                claude_refresh_interval_secs: 600,
+                accounts: vec![account.clone()],
+                ..AppConfig::default()
+            })
             .unwrap();
         assert_eq!(store.load().unwrap().accounts[0].label, "Personal");
         assert!(
@@ -294,7 +291,8 @@ mod tests {
                 .len(),
             1
         );
-        assert_eq!(store.load().unwrap().refresh_interval_secs, 45);
+        assert_eq!(store.load().unwrap().codex_refresh_interval_secs, 45);
+        assert_eq!(store.load().unwrap().claude_refresh_interval_secs, 600);
         assert!(
             store
                 .account_home(&account.id, AccountProvider::Codex)
@@ -338,6 +336,24 @@ mod tests {
         let settings = store.settings_path();
         fs::rename(&settings, settings.with_extension("json.bak")).unwrap();
         assert_eq!(store.load().unwrap().accounts[0].label, "Personal");
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_shared_interval_becomes_codex_interval_and_claude_uses_default() {
+        let root = env::temp_dir().join(format!("codex-keep-warm-test-{}", new_account_id()));
+        let store = Store::new(root.clone()).unwrap();
+        fs::write(
+            store.settings_path(),
+            r#"{"version":1,"refresh_interval_secs":45,"accounts":[]}"#,
+        )
+        .unwrap();
+
+        let config = store.load().unwrap();
+        assert_eq!(config.codex_refresh_interval_secs, 45);
+        assert_eq!(config.claude_refresh_interval_secs, 300);
+
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }

@@ -18,9 +18,9 @@ use dioxus::prelude::*;
 use tokio::time::{Duration, interval};
 
 use domain::{
-    Account, AccountProvider, AccountSnapshot, BankedResets, DEFAULT_REFRESH_INTERVAL_SECS,
-    DailyTime, LimitWindow, UsageWindows, WarmReason, WindowHistory, format_reset, next_slot,
-    plan_warmup, schedule_gap_warning,
+    Account, AccountProvider, AccountSnapshot, AppConfig, BankedResets, DailyTime, LimitWindow,
+    UsageWindows, WarmReason, WindowHistory, format_reset, next_slot, plan_warmup,
+    schedule_gap_warning,
 };
 use storage::{Store, new_account_id};
 
@@ -63,37 +63,39 @@ struct Notice {
 struct AppState {
     store: Option<Store>,
     accounts: Vec<AccountView>,
-    refresh_interval_secs: u64,
+    codex_refresh_secs: u64,
+    claude_refresh_secs: u64,
     fatal: Option<String>,
     notice: Option<Notice>,
 }
 
 impl AppState {
     fn load() -> Self {
-        match Store::discover() {
-            Err(error) => Self {
-                store: None,
-                accounts: Vec::new(),
-                refresh_interval_secs: DEFAULT_REFRESH_INTERVAL_SECS,
-                fatal: Some(error),
-                notice: None,
-            },
-            Ok(store) => match store.load() {
-                Ok(config) => Self {
-                    store: Some(store),
-                    accounts: config.accounts.into_iter().map(AccountView::new).collect(),
-                    refresh_interval_secs: config.refresh_interval_secs,
-                    fatal: None,
-                    notice: None,
-                },
-                Err(error) => Self {
-                    store: Some(store),
-                    accounts: Vec::new(),
-                    refresh_interval_secs: DEFAULT_REFRESH_INTERVAL_SECS,
-                    fatal: Some(error),
-                    notice: None,
-                },
-            },
+        let (store, loaded) = match Store::discover() {
+            Err(error) => (None, Err(error)),
+            Ok(store) => {
+                let loaded = store.load();
+                (Some(store), loaded)
+            }
+        };
+        let (config, fatal) = match loaded {
+            Ok(config) => (config, None),
+            Err(error) => (AppConfig::default(), Some(error)),
+        };
+        Self {
+            store,
+            accounts: config.accounts.into_iter().map(AccountView::new).collect(),
+            codex_refresh_secs: config.codex_refresh_interval_secs,
+            claude_refresh_secs: config.claude_refresh_interval_secs,
+            fatal,
+            notice: None,
+        }
+    }
+
+    fn refresh_secs(&self, provider: AccountProvider) -> u64 {
+        match provider {
+            AccountProvider::Codex => self.codex_refresh_secs,
+            AccountProvider::Claude => self.claude_refresh_secs,
         }
     }
 }
@@ -119,6 +121,7 @@ fn App() -> Element {
     let mut state = use_signal(AppState::load);
     let mut now = use_signal(|| Local::now().timestamp());
     let mut show_add = use_signal(|| false);
+    let mut show_settings = use_signal(|| false);
     let mut new_label = use_signal(String::new);
     let mut new_provider = use_signal(|| AccountProvider::Codex);
     let mut new_times = use_signal(|| {
@@ -144,7 +147,7 @@ fn App() -> Element {
                 .iter()
                 .filter(|view| view.account.connected && view.busy.is_none())
                 .filter(|view| {
-                    tick.is_multiple_of(current_state.refresh_interval_secs)
+                    tick.is_multiple_of(current_state.refresh_secs(view.account.provider))
                         || weekly_reset_needs_probe(view, current)
                 })
                 .map(|view| view.account.id.clone())
@@ -178,20 +181,6 @@ fn App() -> Element {
         .timestamp_opt(*now.read(), 0)
         .single()
         .unwrap_or_else(Local::now);
-    let account_count = snapshot.accounts.len();
-    let schedule_count = snapshot
-        .accounts
-        .iter()
-        .map(|view| view.account.warmup_times.len())
-        .sum::<usize>();
-    let next_warmup = snapshot
-        .accounts
-        .iter()
-        .filter(|view| view.account.enabled)
-        .filter_map(|view| next_slot(&local_now, &view.account.warmup_times))
-        .min_by_key(|slot| slot.at)
-        .map(|slot| format_slot(slot.at))
-        .unwrap_or_else(|| "No times set".to_string());
     let selected_provider = *new_provider.read();
     let provider_copy = match &selected_provider {
         AccountProvider::Codex => {
@@ -209,17 +198,14 @@ fn App() -> Element {
             header { class: "topbar",
                 div { class: "brand",
                     div { class: "brand-mark", "CK" }
-                    div {
-                        strong { "Codex Keep Warm" }
-                        span { "Local Codex and Claude scheduler" }
-                    }
+                    strong { "Codex Keep Warm" }
                 }
                 div { class: "top-actions",
-                    div { class: "scheduler-state",
-                        span { class: "pulse-dot" }
-                        "Scheduler running"
+                    button {
+                        class: "button ghost",
+                        onclick: move |_| show_settings.set(true),
+                        "Settings"
                     }
-                    StartupToggle { state }
                     button {
                         class: "button primary",
                         onclick: move |_| {
@@ -229,21 +215,6 @@ fn App() -> Element {
                         },
                         "+ Add account"
                     }
-                }
-            }
-
-            section { class: "hero",
-                div {
-                    p { class: "eyebrow", "Quota alignment" }
-                    h1 { "Codex and Claude, lined up." }
-                    p { class: "hero-copy",
-                        "Scheduled warmups share one guard per account. Claude OAuth quota drives reset-driven and opportunistic warmups when usage windows are available; refresh failures stay visible without disconnecting identity."
-                    }
-                }
-                div { class: "summary-grid",
-                    SummaryCard { value: account_count.to_string(), label: "Accounts".to_string() }
-                    SummaryCard { value: schedule_count.to_string(), label: "Daily slots".to_string() }
-                    SummaryCard { value: next_warmup, label: "Next scheduled".to_string() }
                 }
             }
 
@@ -280,28 +251,6 @@ fn App() -> Element {
                 }
             } else {
                 section { class: "account-list",
-                    div { class: "section-heading",
-                        div {
-                            p { class: "eyebrow", "Accounts" }
-                            h2 { "Windows and warmup times" }
-                        }
-                        label { class: "poll-setting",
-                            "Refresh every"
-                            input {
-                                r#type: "number",
-                                min: "5",
-                                max: "{DEFAULT_REFRESH_INTERVAL_SECS}",
-                                value: "{snapshot.refresh_interval_secs}",
-                                aria_label: "Limit refresh interval in seconds",
-                                onchange: move |event| {
-                                    if let Ok(seconds) = event.value().parse() {
-                                        set_refresh_interval(state, seconds);
-                                    }
-                                }
-                            }
-                            "seconds"
-                        }
-                    }
 
                     for view in snapshot.accounts {
                         {
@@ -539,6 +488,47 @@ fn App() -> Element {
             }
         }
 
+        if *show_settings.read() {
+            div { class: "modal-backdrop", role: "presentation",
+                section { class: "modal", role: "dialog", aria_modal: "true", aria_labelledby: "settings-title",
+                    div { class: "modal-head",
+                        h2 { id: "settings-title", "Settings" }
+                        button {
+                            class: "modal-close",
+                            aria_label: "Close",
+                            onclick: move |_| show_settings.set(false),
+                            "×"
+                        }
+                    }
+                    for provider in [AccountProvider::Codex, AccountProvider::Claude] {
+                        {
+                            let name = provider_name(&provider);
+                            let (min, max) = provider.refresh_secs_bounds();
+                            let secs = state.read().refresh_secs(provider);
+                            rsx! {
+                                label { class: "field", key: "{name}",
+                                    span { "{name} automatic refresh ({min}–{max} seconds)" }
+                                    input {
+                                        r#type: "number",
+                                        min: "{min}",
+                                        max: "{max}",
+                                        value: "{secs}",
+                                        aria_label: "{name} refresh interval in seconds",
+                                        onchange: move |event| {
+                                            if let Ok(seconds) = event.value().parse() {
+                                                set_refresh_interval(state, provider, seconds);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    StartupToggle { state }
+                }
+            }
+        }
+
         if *show_add.read() {
             div { class: "modal-backdrop", role: "presentation",
                 section { class: "modal", role: "dialog", aria_modal: "true", aria_labelledby: "add-title",
@@ -658,7 +648,7 @@ fn StartupToggle(mut state: Signal<AppState>) -> Element {
     let mut enabled = use_signal(startup::is_enabled);
 
     rsx! {
-        div { class: "scheduler-state",
+        div { class: "setting-toggle",
             "Start with Windows"
             button {
                 class: if *enabled.read() { "switch on" } else { "switch" },
@@ -697,16 +687,6 @@ fn StartupToggle(mut state: Signal<AppState>) -> Element {
 #[component]
 fn StartupToggle(_state: Signal<AppState>) -> Element {
     None
-}
-
-#[component]
-fn SummaryCard(value: String, label: String) -> Element {
-    rsx! {
-        div { class: "summary-card",
-            strong { "{value}" }
-            span { "{label}" }
-        }
-    }
 }
 
 #[component]
@@ -2152,11 +2132,17 @@ fn persist(mut state: Signal<AppState>) {
                 .iter()
                 .map(|view| view.account.clone())
                 .collect::<Vec<_>>();
-            (store, accounts, current.refresh_interval_secs)
+            let config = AppConfig {
+                codex_refresh_interval_secs: current.codex_refresh_secs,
+                claude_refresh_interval_secs: current.claude_refresh_secs,
+                accounts,
+                ..AppConfig::default()
+            };
+            (store, config)
         })
     };
-    if let Some((store, accounts, refresh_interval_secs)) = data
-        && let Err(error) = store.save_accounts(&accounts, refresh_interval_secs)
+    if let Some((store, config)) = data
+        && let Err(error) = store.save(&config)
     {
         state.write().notice = Some(Notice {
             message: error,
@@ -2165,8 +2151,12 @@ fn persist(mut state: Signal<AppState>) {
     }
 }
 
-fn set_refresh_interval(mut state: Signal<AppState>, seconds: u64) {
-    state.write().refresh_interval_secs = seconds.clamp(5, DEFAULT_REFRESH_INTERVAL_SECS);
+fn set_refresh_interval(mut state: Signal<AppState>, provider: AccountProvider, seconds: u64) {
+    let seconds = provider.clamp_refresh_secs(seconds);
+    match provider {
+        AccountProvider::Codex => state.write().codex_refresh_secs = seconds,
+        AccountProvider::Claude => state.write().claude_refresh_secs = seconds,
+    }
     persist(state);
 }
 
